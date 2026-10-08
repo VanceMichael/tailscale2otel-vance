@@ -921,11 +921,99 @@
         "download_enabled": {
           "type": "boolean"
         },
+        "downloads": {
+          "items": {
+            "properties": {
+              "edition": {
+                "type": "string"
+              },
+              "failures": {
+                "type": "integer"
+              },
+              "last_at": {
+                "type": "string"
+              },
+              "last_error": {
+                "type": "string"
+              },
+              "last_result": {
+                "type": "string"
+              },
+              "unmodified": {
+                "type": "integer"
+              },
+              "updated": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
         "enabled": {
           "type": "boolean"
         },
+        "generation": {
+          "type": "integer"
+        },
         "geo_dims": {
           "type": "boolean"
+        },
+        "last_reload_error": {
+          "type": "string"
+        },
+        "last_reload_result": {
+          "type": "string"
+        },
+        "last_scan_at": {
+          "type": "string"
+        },
+        "pair_reloads": {
+          "type": "integer"
+        },
+        "paired": {
+          "type": "boolean"
+        },
+        "pending": {
+          "properties": {
+            "asn_build_time": {
+              "type": "string"
+            },
+            "asn_type": {
+              "type": "string"
+            },
+            "at": {
+              "type": "string"
+            },
+            "country_build_time": {
+              "type": "string"
+            },
+            "country_type": {
+              "type": "string"
+            },
+            "ready_asn": {
+              "type": "boolean"
+            },
+            "ready_country": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "waiting_for": {
+              "type": "string"
+            }
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "pending_reloads": {
+          "type": "integer"
+        },
+        "published_at": {
+          "type": "string"
         },
         "reload_failures": {
           "type": "integer"

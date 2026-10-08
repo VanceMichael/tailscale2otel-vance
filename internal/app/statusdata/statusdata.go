@@ -381,11 +381,15 @@ type RDNSInfo struct {
 // false when enrichment.geoip.enabled is off, and the rest of the fields are
 // then zero.
 //
-// BuildTime is MaxMind's build date for each loaded database, NOT when it was
-// downloaded, because that is what actually tells an operator whether the data
-// is current: an updater that runs on schedule and fails every fetch looks
-// healthy by any download-recency measure. An empty Type/BuildTime means that
-// database is not loaded at all.
+// BuildTime is MaxMind's build date for each database IN THE PUBLISHED
+// GENERATION, NOT when it was downloaded, because that is what actually tells
+// an operator whether the data is current: an updater that runs on schedule
+// and fails every fetch looks healthy by any download-recency measure. An
+// empty Type/BuildTime means that database is not loaded at all. When both
+// databases are configured they publish as one generation — a newer file whose
+// pair is incomplete is withheld and surfaces in Pending rather than in the
+// published build times, so what this card reports is always exactly what
+// lookups use.
 type GeoIPInfo struct {
 	Enabled bool `json:"enabled"`
 
@@ -411,9 +415,73 @@ type GeoIPInfo struct {
 	Skipped        int64 `json:"skipped"`
 	Reloads        int64 `json:"reloads"`
 	ReloadFailures int64 `json:"reload_failures"`
+
+	// Paired reports that both a country and an ASN path are configured, so the
+	// two databases commit together as one Generation. With only one path
+	// configured Generation still advances on each swap but there is no
+	// partner to wait for and Pending is never set.
+	Paired     bool   `json:"paired"`
+	Generation uint64 `json:"generation,omitempty"`
+	// PublishedAt is when the current generation committed; empty before the
+	// first successful load. RFC3339.
+	PublishedAt string `json:"published_at,omitempty"`
+	// LastScanAt is when the paths were most recently stat'ed. RFC3339.
+	LastScanAt string `json:"last_scan_at,omitempty"`
+	// LastResult is the latest scan's outcome: "published", "pending",
+	// "failed" or "unchanged". Empty before the first scan.
+	LastResult string `json:"last_reload_result,omitempty"`
+	// LastError is the joined stat/read/parse error from the most recent failed
+	// scan, verbatim (local-operator-only surface).
+	LastError string `json:"last_reload_error,omitempty"`
+	// PairReloads counts committed generations; PendingReloads counts scans
+	// that validated a newer file but withheld it because the pair was not yet
+	// complete. Both exclude the initial startup load.
+	PairReloads    int64 `json:"pair_reloads"`
+	PendingReloads int64 `json:"pending_reloads"`
+	// Pending describes the withheld update while LastResult == "pending".
+	Pending *GeoIPPending `json:"pending,omitempty"`
+
+	// Downloads is the built-in downloader's per-edition outcome tally, shown
+	// here so a pending/failed pair can be correlated with the edition whose
+	// fetch failed even with self-observability off. Empty when disabled.
+	Downloads []GeoIPDownload `json:"downloads,omitempty"`
+
 	// GeoDims reports whether country labels are also going onto flow METRICS
 	// (cardinality.flow.geo_dims), since that is the setting with a cost.
 	GeoDims bool `json:"geo_dims"`
+}
+
+// GeoIPPending describes a newer database that validated but is being withheld
+// until the country+ASN pair can commit as one generation.
+type GeoIPPending struct {
+	// At is when the pending condition was most recently observed. RFC3339.
+	At string `json:"at"`
+	// WaitingFor is "country" or "asn" — the slot blocking the commit.
+	WaitingFor string `json:"waiting_for"`
+	// Reason is "missing" (the partner file does not exist yet) or "unchanged"
+	// (the partner was not rotated in the same round).
+	Reason string `json:"reason"`
+	// ReadyCountry/ReadyASN report which slot's new file is held back; in a
+	// two-database configuration exactly one is set.
+	ReadyCountry bool `json:"ready_country"`
+	ReadyASN     bool `json:"ready_asn"`
+	// Identity of the held-back candidate.
+	CountryType      string `json:"country_type,omitempty"`
+	CountryBuildTime string `json:"country_build_time,omitempty"` // RFC3339
+	ASNType          string `json:"asn_type,omitempty"`
+	ASNBuildTime     string `json:"asn_build_time,omitempty"` // RFC3339
+}
+
+// GeoIPDownload is one configured edition's download tally.
+type GeoIPDownload struct {
+	Edition    string `json:"edition"`
+	Updated    int64  `json:"updated"`
+	Unmodified int64  `json:"unmodified"`
+	Failures   int64  `json:"failures"`
+	// LastResult is "updated", "unmodified" or "failure".
+	LastResult string `json:"last_result"`
+	LastError  string `json:"last_error,omitempty"`
+	LastAt     string `json:"last_at,omitempty"` // RFC3339
 }
 
 // FlowStoreFailure is one tailnet's persistent flow store failing to open.

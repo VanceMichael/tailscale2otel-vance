@@ -17,6 +17,7 @@ import (
 	"github.com/rknightion/tailscale2otel/v5/internal/config"
 	"github.com/rknightion/tailscale2otel/v5/internal/configexport"
 	"github.com/rknightion/tailscale2otel/v5/internal/dedup"
+	"github.com/rknightion/tailscale2otel/v5/internal/geoip"
 	"github.com/rknightion/tailscale2otel/v5/internal/metricdoc"
 	"github.com/rknightion/tailscale2otel/v5/internal/redact"
 	"github.com/rknightion/tailscale2otel/v5/internal/telemetry"
@@ -696,6 +697,14 @@ func (a *App) geoipInfo() statusdata.GeoIPInfo {
 		Skipped:         s.Skipped,
 		Reloads:         s.CountryReloads + s.ASNReloads,
 		ReloadFailures:  s.ReloadFailures,
+		Paired:          s.Paired,
+		Generation:      s.Generation,
+		LastResult:      s.LastResult,
+		LastError:       s.LastError,
+		PairReloads:     s.PairReloads,
+		PendingReloads:  s.PendingReloads,
+		Pending:         geoipPendingInfo(s.Pending),
+		Downloads:       geoipDownloads(s.Downloads),
 		GeoDims:         a.cfg.Cardinality.Flow.GeoDims,
 	}
 	now := time.Now()
@@ -707,7 +716,66 @@ func (a *App) geoipInfo() statusdata.GeoIPInfo {
 		info.ASNBuildTime = s.ASNBuildTime.UTC().Format(rfc3339)
 		info.ASNAge = humanDuration(now.Sub(s.ASNBuildTime))
 	}
+	if !s.PublishedAt.IsZero() {
+		info.PublishedAt = s.PublishedAt.UTC().Format(rfc3339)
+	}
+	if !s.LastScanAt.IsZero() {
+		info.LastScanAt = s.LastScanAt.UTC().Format(rfc3339)
+	}
 	return info
+}
+
+// geoipPendingInfo maps the geoip package's pending state to the status model.
+func geoipPendingInfo(p *geoip.PendingState) *statusdata.GeoIPPending {
+	if p == nil {
+		return nil
+	}
+	info := &statusdata.GeoIPPending{
+		At:           p.At.UTC().Format(rfc3339),
+		WaitingFor:   p.WaitingFor,
+		Reason:       p.Reason,
+		ReadyCountry: p.ReadyCountry,
+		ReadyASN:     p.ReadyASN,
+		CountryType:  p.CountryType,
+		ASNType:      p.ASNType,
+	}
+	if !p.CountryBuildTime.IsZero() {
+		info.CountryBuildTime = p.CountryBuildTime.UTC().Format(rfc3339)
+	}
+	if !p.ASNBuildTime.IsZero() {
+		info.ASNBuildTime = p.ASNBuildTime.UTC().Format(rfc3339)
+	}
+	return info
+}
+
+// geoipDownloads maps the per-edition download tally into a stable,
+// edition-sorted slice for the JSON/HTML status surface.
+func geoipDownloads(in map[string]geoip.DownloadStatus) []statusdata.GeoIPDownload {
+	if len(in) == 0 {
+		return nil
+	}
+	editions := make([]string, 0, len(in))
+	for edition := range in {
+		editions = append(editions, edition)
+	}
+	sort.Strings(editions)
+	out := make([]statusdata.GeoIPDownload, 0, len(editions))
+	for _, edition := range editions {
+		d := in[edition]
+		row := statusdata.GeoIPDownload{
+			Edition:    edition,
+			Updated:    d.Updated,
+			Unmodified: d.Unmodified,
+			Failures:   d.Failures,
+			LastResult: d.LastResult,
+			LastError:  d.LastError,
+		}
+		if !d.LastAt.IsZero() {
+			row.LastAt = d.LastAt.UTC().Format(rfc3339)
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func (a *App) dedupInfo() []statusdata.DedupInfo {

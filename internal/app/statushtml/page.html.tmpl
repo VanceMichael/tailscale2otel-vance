@@ -697,13 +697,30 @@ a.cta:hover{background:var(--t2o-hover);filter:none}
     <div class="sub-h">GeoIP &amp; ASN enrichment</div>
     {{if .GeoIP.Enabled}}
     <div class="cards">
+      <div class="card{{if eq .GeoIP.LastResult "pending"}} warn2{{end}}{{if eq .GeoIP.LastResult "failed"}} crit{{end}}"><div class="k">{{if .GeoIP.Paired}}Published generation{{else}}Database load{{end}}</div><div class="v" style="font-size:16px">{{if .GeoIP.Paired}}#{{.GeoIP.Generation}}{{else}}single database{{end}}</div><div class="sub">{{if .GeoIP.PublishedAt}}committed {{.GeoIP.PublishedAt}}{{else}}nothing committed yet{{end}}{{if .GeoIP.LastScanAt}} · last scan {{.GeoIP.LastScanAt}}{{end}} · <span class="badge {{if eq .GeoIP.LastResult "published"}}ok{{end}}{{if eq .GeoIP.LastResult "failed"}}err{{end}}{{if eq .GeoIP.LastResult "pending"}}warn{{end}}">{{if .GeoIP.LastResult}}{{.GeoIP.LastResult}}{{else}}no scan{{end}}</span></div></div>
       <div class="card"><div class="k">Country database</div><div class="v" style="font-size:16px">{{if .GeoIP.CountryType}}{{.GeoIP.CountryType}}{{else}}not loaded{{end}}</div><div class="sub">{{if .GeoIP.CountryBuildTime}}built {{.GeoIP.CountryAge}} ago ({{.GeoIP.CountryBuildTime}}){{else}}no database at {{if .GeoIP.CountryPath}}{{.GeoIP.CountryPath}}{{else}}any configured path{{end}}{{end}}</div></div>
       <div class="card"><div class="k">ASN database</div><div class="v" style="font-size:16px">{{if .GeoIP.ASNType}}{{.GeoIP.ASNType}}{{else}}not loaded{{end}}</div><div class="sub">{{if .GeoIP.ASNBuildTime}}built {{.GeoIP.ASNAge}} ago ({{.GeoIP.ASNBuildTime}}){{else}}no database at {{if .GeoIP.ASNPath}}{{.GeoIP.ASNPath}}{{else}}any configured path{{end}}{{end}}</div></div>
       <div class="card"><div class="k">Country lookups</div><div class="v">{{add64 .GeoIP.CountryHits .GeoIP.CountryMisses}}</div><div class="sub">hit {{.GeoIP.CountryHits}} · miss {{.GeoIP.CountryMisses}}</div></div>
       <div class="card"><div class="k">ASN lookups</div><div class="v">{{add64 .GeoIP.ASNHits .GeoIP.ASNMisses}}</div><div class="sub">hit {{.GeoIP.ASNHits}} · miss {{.GeoIP.ASNMisses}}</div></div>
       <div class="card"><div class="k">Skipped</div><div class="v">{{.GeoIP.Skipped}}</div><div class="sub">not globally routable — every tailnet address lands here</div></div>
-      <div class="card"><div class="k">Reloads</div><div class="v">{{.GeoIP.Reloads}}</div><div class="sub">{{if .GeoIP.ReloadFailures}}{{.GeoIP.ReloadFailures}} failed — see the logs{{else}}no failures{{end}}</div></div>
+      <div class="card"><div class="k">Reloads</div><div class="v">{{if .GeoIP.Paired}}{{.GeoIP.PairReloads}} generations{{else}}{{.GeoIP.Reloads}}{{end}}</div><div class="sub">{{.GeoIP.Reloads}} file swaps{{if .GeoIP.PendingReloads}} · {{.GeoIP.PendingReloads}} withheld pending{{end}}{{if .GeoIP.ReloadFailures}} · {{.GeoIP.ReloadFailures}} failed{{end}}</div></div>
     </div>
+    {{if and (eq .GeoIP.LastResult "pending") .GeoIP.Pending}}{{with .GeoIP.Pending}}
+    <p class="note" style="color:var(--warn);margin-top:10px">
+      <strong>Update waiting for the {{.WaitingFor}} database.</strong>
+      A newer {{if .ReadyCountry}}country database ({{if .CountryType}}{{.CountryType}}, {{end}}built {{.CountryBuildTime}}){{else if .ReadyASN}}ASN database ({{if .ASNType}}{{.ASNType}}, {{end}}built {{.ASNBuildTime}}){{else}}database{{end}}
+      validated but is withheld because the {{.WaitingFor}} file is {{if eq .Reason "missing"}}not present yet{{else}}not rotated in the same round{{end}}.
+      {{if $.GeoIP.Paired}}Lookups keep using the complete previously published pair (generation #{{$.GeoIP.Generation}}); the new pair commits on the next reload once both files validate.{{else}}The database commits on the next reload once the file is present.{{end}}
+    </p>
+    {{end}}{{end}}
+    {{if eq .GeoIP.LastResult "failed"}}
+    <p class="note err" style="margin-top:10px"><strong>Last reload failed{{if .GeoIP.LastScanAt}} at {{.GeoIP.LastScanAt}}{{end}}.</strong> {{.GeoIP.LastError}} — serving the previously published {{if .GeoIP.Paired}}pair{{else}}database{{end}}; the next reload retries automatically.</p>
+    {{end}}
+    {{if .GeoIP.Downloads}}
+    <p class="muted" style="margin-top:10px">Built-in downloader, per edition:
+      {{range .GeoIP.Downloads}}<span class="badge {{if eq .LastResult "failure"}}err{{else if eq .LastResult "updated"}}ok{{else}}{{end}}"><code>{{.Edition}}</code> — {{.Updated}} updated · {{.Unmodified}} unmodified · {{.Failures}} failed{{if .LastError}} ({{.LastError}}){{end}}</span> {{end}}
+    </p>
+    {{end}}
     <p class="muted" style="margin-top:12px">
       The build time above is MaxMind&rsquo;s, not the download time — an updater that runs on schedule and fails
       every fetch still looks busy, and only the build date exposes it.

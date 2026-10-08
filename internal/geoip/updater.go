@@ -131,15 +131,30 @@ func (u *Updater) update(ctx context.Context) {
 }
 
 func (u *Updater) reload() {
-	changed, err := u.db.Reload()
-	if err != nil {
-		u.logger.Warn("geoip database reload failed; keeping the loaded database", "error", err)
-		return
-	}
-	if changed {
+	out := u.db.Reload()
+	switch out.Result {
+	case ReloadPublished:
+		if !out.Changed {
+			return
+		}
 		s := u.db.Stats()
-		u.logger.Info("geoip databases reloaded",
+		u.logger.Info("geoip databases published as a new generation",
+			"generation", out.Generation,
 			"country_build_time", s.CountryBuildTime, "asn_build_time", s.ASNBuildTime)
+	case ReloadPending:
+		// One half of the pair validated and the other is not ready yet. Not a
+		// failure: the complete published pair keeps serving, and the next tick
+		// tries again.
+		s := u.db.Stats()
+		if s.Pending != nil {
+			p := s.Pending
+			u.logger.Info("geoip pair update is incomplete; serving the previously published pair until both databases validate",
+				"generation", out.Generation, "waiting_for", p.WaitingFor, "reason", p.Reason,
+				"held_country_type", p.CountryType, "held_country_build_time", p.CountryBuildTime,
+				"held_asn_type", p.ASNType, "held_asn_build_time", p.ASNBuildTime)
+		}
+	case ReloadFailed:
+		u.logger.Warn("geoip database reload failed; serving the previously published pair", "error", out.Err)
 	}
 }
 

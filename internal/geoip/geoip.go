@@ -27,13 +27,22 @@
 // default and must never be able to kill a running exporter. Do not "optimize"
 // this back to mmap.
 //
-// Databases are swapped atomically by Reload (see updater.go for the schedule),
-// so an operator's geoipupdate cron — or this package's own MaxMind downloader
-// (maxmind.go) — can rewrite the files under a running process.
+// The databases commit as GENERATIONS through one boundary shared by the
+// initial Open, the scheduled Reload (see updater.go), the operator-managed
+// file path and this package's own MaxMind downloader (maxmind.go). When BOTH
+// a country and an ASN path are configured, a scan publishes a new generation
+// only when BOTH files are present and validate in that same scan: one newer
+// file next to a partner that is missing, half-replaced, corrupt or simply not
+// rotated in the same round is withheld (pending), and the previously
+// published PAIR keeps serving until both halves are ready. A lookup can
+// therefore see only old-country+old-ASN or new-country+new-ASN, never a
+// stitched-together half-generation. With a single path configured the one
+// database swaps independently exactly as it always has.
 //
 // Everything here is fail-open. A missing, unreadable or stale database means
-// the geo attributes are simply absent from the emitted telemetry; it is never a
-// startup failure and never blocks a lookup.
+// the geo attributes are simply absent from the emitted telemetry; it is never
+// a startup failure and never blocks a lookup. A failed or withheld update
+// costs freshness, never availability.
 package geoip
 
 import (
@@ -214,12 +223,83 @@ const maxDatabaseBytes = 512 << 20
 // stats holds the cumulative counters surfaced by Stats and flushed as OTEL
 // counter deltas by report(). Guarded by DB.mu.
 type stats struct {
-	countryHits, countryMisses int64
-	asnHits, asnMisses         int64
-	skipped                    int64
-	countryReloads, asnReloads int64
-	reloadFailures             int64
+	countryHits, countryMisses   int64
+	asnHits, asnMisses           int64
+	skipped                      int64
+	countryReloads, asnReloads   int64
+	countryFailures, asnFailures int64
+	reloadFailures               int64
+	// pairPublishes counts committed generations; pendingReloads counts scans
+	// that validated a newer file but withheld it because the pair was not yet
+	// complete. In a one-database configuration pairPublishes counts that
+	// database's swaps; pendingReloads never moves.
+	pairPublishes  int64
+	pendingReloads int64
+
+	// downloads is the per-edition outcome tally of the built-in downloader,
+	// so the status page can show it with self-observability off. Keyed by
+	// edition (the operator's short configured list — bounded).
+	downloads map[string]*downloadStats
 }
+
+// downloadStats is one edition's cumulative download tally and last attempt.
+type downloadStats struct {
+	updated, unmodified, failures int64
+	lastResult                    string // resultUpdated | resultUnmodified | resultFailure
+	lastError                     string
+	lastAt                        time.Time
+}
+
+// DownloadStatus is one edition's download tally for the admin status page.
+type DownloadStatus struct {
+	Updated, Unmodified, Failures int64
+	LastResult                    string
+	LastError                     string
+	LastAt                        time.Time
+}
+
+// Reload result values for Stats.LastResult and ReloadOutcome.Result.
+const (
+	// ReloadUnchanged: no configured file differed from the published generation.
+	ReloadUnchanged = "unchanged"
+	// ReloadPublished: a new generation was committed (ReloadOutcome.Changed).
+	ReloadPublished = "published"
+	// ReloadPending: a newer file validated but its pair was incomplete, so the
+	// previously published generation keeps serving.
+	ReloadPending = "pending"
+	// ReloadFailed: a present file failed to stat/read/parse; the previously
+	// published generation keeps serving.
+	ReloadFailed = "failed"
+)
+
+// PendingState describes a validated newer database that is being withheld
+// because the configured pair cannot yet be published as one generation. It is
+// set while Stats.LastResult == ReloadPending.
+type PendingState struct {
+	// At is when the pending condition was most recently observed.
+	At time.Time
+	// WaitingFor names the slot that blocks the commit: databaseCountry or
+	// databaseASN.
+	WaitingFor string
+	// Reason is "missing" (the waiting database's file does not exist yet — a
+	// download has not landed or the rotation is halfway through) or
+	// "unchanged" (the partner was replaced this round but this file was not).
+	Reason string
+	// ReadyCountry/ReadyASN report which slot's NEW file validated and is held
+	// back. In a two-database configuration exactly one is set.
+	ReadyCountry bool
+	ReadyASN     bool
+	// Identity of the held-back candidate, so an operator can see what is
+	// waiting without it ever being published.
+	CountryType, ASNType           string
+	CountryBuildTime, ASNBuildTime time.Time
+}
+
+// Pending reasons carried by PendingState.
+const (
+	pendingMissing   = "missing"
+	pendingUnchanged = "unchanged"
+)
 
 // Stats is an absolute snapshot for the admin status page. report() emits the
 // same counters as OTEL metrics.
@@ -230,11 +310,45 @@ type Stats struct {
 	CountryReloads, ASNReloads int64
 	ReloadFailures             int64
 
+	// Pair-generation accounting. PairReloads counts committed generations and
+	// PendingReloads the scans that withheld an incomplete pair; Generation is
+	// the committed generation number (0 before the first successful load).
+	PairReloads    int64
+	PendingReloads int64
+	Generation     uint64
+	Paired         bool
+	PublishedAt    time.Time
+	LastScanAt     time.Time
+	// LastResult is one of the Reload* constants; empty before the first scan.
+	LastResult  string
+	LastError   string
+	LastErrorAt time.Time
+	// Pending describes the waiting update while LastResult == ReloadPending.
+	Pending *PendingState
+
+	// Downloads is the per-edition built-in downloader tally; empty when the
+	// downloader is off.
+	Downloads map[string]DownloadStatus
+
 	// Loaded database identity, for the status page and the build-time gauge. A
-	// zero build time means the database is not loaded.
+	// zero build time means the database is not loaded. These always describe
+	// the PUBLISHED generation, never a withheld candidate.
 	CountryPath, ASNPath           string
 	CountryType, ASNType           string
 	CountryBuildTime, ASNBuildTime time.Time
+}
+
+// ReloadOutcome reports what one scan (an initial Open or a scheduled Reload)
+// did.
+type ReloadOutcome struct {
+	// Changed reports whether a new generation was committed.
+	Changed bool
+	// Result is one of the Reload* constants.
+	Result string
+	// Generation is the committed generation after the scan.
+	Generation uint64
+	// Err joins the stat/read/parse errors when Result == ReloadFailed.
+	Err error
 }
 
 // DB holds the loaded databases and swaps them atomically on Reload.
@@ -252,49 +366,330 @@ type DB struct {
 	asn     *reader
 	stats   stats
 
+	// generation is the number of committed pairs; a publish of either slot
+	// advances it. The rest is the latest scan's disposition, surfaced on the
+	// status page so an operator can tell a published pair from a withheld
+	// update and read why it was withheld. All guarded by mu.
+	generation  uint64
+	publishedAt time.Time
+	lastScanAt  time.Time
+	lastResult  string
+	lastError   string
+	lastErrorAt time.Time
+	pending     *PendingState
+
 	// reported is report()'s delta baseline; single-writer (the updater's
 	// goroutine), guarded by mu like everything else.
 	reported stats
 }
 
-// Open builds a DB from the configured paths. A path that does not exist yet is
-// remembered and left unloaded — a cold start whose scheduled download has not
-// landed must not fail. A path that exists but is not a usable MaxMind database
-// IS reported as an error: the operator pointed at something real and wrong, and
-// treating that as "not downloaded yet" would hide the mistake forever.
+// Open builds a DB from the configured paths and runs the SAME generation scan
+// Reload runs, so startup loading has exactly the commit boundary a later tick
+// has (and a process restart can never publish a half pair that a running
+// process would have withheld):
 //
-// The returned *DB is ALWAYS usable, even alongside a non-nil error. Whatever
-// loaded is serving, whatever did not is simply absent, and the configured paths
-// are retained either way so a later Reload can pick up a corrected file. A
-// caller that wants to be strict can still treat the error as fatal; the app
-// deliberately does not, because degraded enrichment must not become a failed
-// startup.
+//   - With both paths configured, both present files must validate together or
+//     neither publishes. One present file next to a missing partner is a
+//     pending pair (no error — a cold start's scheduled download may simply not
+//     have landed yet); a present but unreadable partner is an error. In both
+//     cases nothing serves until a later scan completes the pair.
+//   - With one path configured, that database loads independently, as it
+//     always has.
+//
+// A path that exists but is not a usable MaxMind database IS reported as an
+// error rather than silently treated as "not downloaded yet": the operator
+// pointed at something real and wrong, and hiding that would mask the mistake
+// forever.
+//
+// The returned *DB is ALWAYS usable, even alongside a non-nil error: whatever
+// generation published is serving, the configured paths are retained, and a
+// later Reload picks corrected files up. A caller that wants to be strict can
+// still treat the error as fatal; the app deliberately does not, because
+// degraded enrichment must not become a failed startup.
 func Open(opts Options) (*DB, error) {
-	db := &DB{countryPath: opts.CountryPath, asnPath: opts.ASNPath}
-	var errs []error
-	var err error
-	if db.country, err = openIfPresent(opts.CountryPath); err != nil {
-		errs = append(errs, err)
+	db := &DB{
+		countryPath: opts.CountryPath,
+		asnPath:     opts.ASNPath,
+		stats:       stats{downloads: map[string]*downloadStats{}},
 	}
-	if db.asn, err = openIfPresent(opts.ASNPath); err != nil {
-		errs = append(errs, err)
-	}
-	return db, errors.Join(errs...)
+	// The initial scan records its disposition for the status page but moves no
+	// cumulative RELOAD counters — those count scans after startup.
+	out := db.evaluate(db.scan(), false)
+	return db, out.Err
 }
 
-// openIfPresent loads path, returning (nil, nil) when path is empty or absent.
-func openIfPresent(path string) (*reader, error) {
+// slotKind identifies one position in the pair.
+type slotKind int
+
+const (
+	slotCountry slotKind = iota
+	slotASN
+)
+
+func (k slotKind) name() string {
+	if k == slotASN {
+		return databaseASN
+	}
+	return databaseCountry
+}
+
+// slotDisposition is what one scan found at one configured path.
+type slotDisposition int
+
+const (
+	// slotInactive: no path configured for this slot.
+	slotInactive slotDisposition = iota
+	// slotUnchanged: the file is present and its (mtime, size) matches the
+	// reader the published generation holds — nothing to do.
+	slotUnchanged
+	// slotCandidate: the file is present, differs from what is published, and
+	// has been read and parsed successfully THIS scan.
+	slotCandidate
+	// slotAbsent: the configured path does not exist (yet, or any more — a
+	// deletion never unloads a published reader).
+	slotAbsent
+	// slotErrored: stat, read or parse failed; err says why.
+	slotErrored
+)
+
+// slotPlan is one slot's scan result.
+type slotPlan struct {
+	kind slotKind
+	disp slotDisposition
+	next *reader // slotCandidate only
+	err  error   // slotErrored only
+}
+
+// scan stats every configured path and validates each changed file. The slow
+// reads and parses happen WITHOUT d.mu held; only the snapshot of the two
+// committed pointers takes the lock, and the eventual commit takes the write
+// lock once.
+func (d *DB) scan() [2]slotPlan {
+	d.mu.RLock()
+	paths := [2]string{d.countryPath, d.asnPath}
+	current := [2]*reader{d.country, d.asn}
+	d.mu.RUnlock()
+	return [2]slotPlan{
+		planSlot(slotCountry, paths[0], current[0]),
+		planSlot(slotASN, paths[1], current[1]),
+	}
+}
+
+// planSlot stats path and, when it differs from the committed reader cur,
+// reads and parses it into a validated candidate.
+func planSlot(kind slotKind, path string, cur *reader) slotPlan {
+	p := slotPlan{kind: kind}
 	if path == "" {
-		return nil, nil
+		return p
 	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			p.disp = slotAbsent
+			return p
 		}
-		return nil, fmt.Errorf("stat geoip database %s: %w", path, err)
+		p.disp = slotErrored
+		p.err = fmt.Errorf("stat geoip database %s: %w", path, err)
+		return p
 	}
-	return openAt(path, fi)
+	if cur != nil && cur.mtime.Equal(fi.ModTime()) && cur.size == fi.Size() {
+		p.disp = slotUnchanged
+		return p
+	}
+	r, err := openAt(path, fi)
+	if err != nil {
+		p.disp = slotErrored
+		p.err = err
+		return p
+	}
+	p.disp = slotCandidate
+	p.next = r
+	return p
+}
+
+// evaluate is the single commit boundary shared by Open and Reload. count
+// gates the cumulative reload counters (true for a scheduled scan, false for
+// the startup load).
+func (d *DB) evaluate(plans [2]slotPlan, count bool) ReloadOutcome {
+	now := time.Now()
+	active, candidates := 0, 0
+	var errs []error
+	var failedSlots []slotKind
+	for i := range plans {
+		p := &plans[i]
+		if p.disp == slotInactive {
+			continue
+		}
+		active++
+		switch p.disp {
+		case slotCandidate:
+			candidates++
+		case slotErrored:
+			errs = append(errs, p.err)
+			failedSlots = append(failedSlots, p.kind)
+		}
+	}
+
+	// Any stat/read/parse error anywhere aborts the whole commit, regardless of
+	// what else changed: the published pair is the fail-open fallback, and a
+	// validated candidate on the sibling slot is closed rather than published
+	// alone.
+	if len(errs) > 0 {
+		d.recordFailure(plans, failedSlots, now, errs, count)
+		return ReloadOutcome{Result: ReloadFailed, Generation: d.generationValue(), Err: errors.Join(errs...)}
+	}
+
+	// No file differed: a pure stat tick. A stale pending/error disposition
+	// clears, since the files that caused it are no longer offering an update.
+	if candidates == 0 {
+		d.recordUnchanged(now)
+		return ReloadOutcome{Result: ReloadUnchanged, Generation: d.generationValue()}
+	}
+
+	// Paired mode: a generation publishes only when BOTH files validate in THIS
+	// scan. One candidate next to a partner that is absent (a download not
+	// landed, a rotation halfway through) or unchanged (only one half rotated
+	// this round) is withheld as pending, and the published pair keeps serving.
+	// The scan repeats on the next tick, so the withheld half gets another
+	// chance and commits the moment the partner catches up.
+	if active == 2 {
+		for i := range plans {
+			if plans[i].disp != slotCandidate {
+				d.recordPending(plans, &plans[i], now, count)
+				return ReloadOutcome{Result: ReloadPending, Generation: d.generationValue()}
+			}
+		}
+	}
+
+	// All clear: publish the candidates as one generation under a single write
+	// lock. A lookup holding the RLock across both tree walks can never see one
+	// swapped reader and one old reader.
+	d.mu.Lock()
+	old := [2]*reader{d.country, d.asn}
+	for i := range plans {
+		if plans[i].disp != slotCandidate {
+			continue
+		}
+		switch plans[i].kind {
+		case slotCountry:
+			d.country = plans[i].next
+			if count {
+				d.stats.countryReloads++
+			}
+		case slotASN:
+			d.asn = plans[i].next
+			if count {
+				d.stats.asnReloads++
+			}
+		}
+	}
+	d.generation++
+	gen := d.generation
+	d.publishedAt = now
+	d.lastScanAt = now
+	d.lastResult = ReloadPublished
+	d.pending = nil
+	d.lastError = ""
+	if count {
+		d.stats.pairPublishes++
+	}
+	// Close the displaced readers while the write lock is held: every lookup
+	// walking one finished before the lock was acquired, and a reader created
+	// afterwards sees the new pointer. OpenBytes owns a heap slice rather than
+	// a mapping, and Close on it cannot fail.
+	for i := range old {
+		if plans[i].disp == slotCandidate && old[i] != nil {
+			_ = old[i].db.Close()
+		}
+	}
+	d.mu.Unlock()
+
+	return ReloadOutcome{Changed: true, Result: ReloadPublished, Generation: gen}
+}
+
+// recordUnchanged marks a scan that found no differing file.
+func (d *DB) recordUnchanged(now time.Time) {
+	d.mu.Lock()
+	d.lastScanAt = now
+	d.lastResult = ReloadUnchanged
+	d.pending = nil
+	d.lastError = ""
+	d.mu.Unlock()
+}
+
+// recordFailure rejects a scan: candidates validated this round are released
+// unpublished, the failure is recorded per slot, and the published generation
+// stays exactly where it was.
+func (d *DB) recordFailure(plans [2]slotPlan, failedSlots []slotKind, now time.Time, errs []error, count bool) {
+	for i := range plans {
+		if plans[i].disp == slotCandidate {
+			_ = plans[i].next.db.Close()
+		}
+	}
+	failBySlot := map[slotKind]int64{}
+	for _, k := range failedSlots {
+		failBySlot[k]++
+	}
+	d.mu.Lock()
+	d.lastScanAt = now
+	d.lastResult = ReloadFailed
+	d.lastError = errors.Join(errs...).Error()
+	d.lastErrorAt = now
+	d.pending = nil
+	if count {
+		d.stats.reloadFailures += int64(len(errs))
+		d.stats.countryFailures += failBySlot[slotCountry]
+		d.stats.asnFailures += failBySlot[slotASN]
+	}
+	d.mu.Unlock()
+}
+
+// recordPending withholds a scan whose candidate set is one half short of a
+// pair. The validated candidate readers are closed after their identity is
+// captured for the status page — they are re-validated from scratch on the next
+// scan rather than cached, so a replaced file can never be missed.
+func (d *DB) recordPending(plans [2]slotPlan, waiter *slotPlan, now time.Time, count bool) {
+	st := &PendingState{
+		At:         now,
+		WaitingFor: waiter.kind.name(),
+		Reason:     pendingUnchanged,
+	}
+	if waiter.disp == slotAbsent {
+		st.Reason = pendingMissing
+	}
+	for i := range plans {
+		p := &plans[i]
+		if p.disp != slotCandidate {
+			continue
+		}
+		md := p.next.db.Metadata
+		switch p.kind {
+		case slotCountry:
+			st.ReadyCountry = true
+			st.CountryType = md.DatabaseType
+			st.CountryBuildTime = buildTime(md.BuildEpoch)
+		case slotASN:
+			st.ReadyASN = true
+			st.ASNType = md.DatabaseType
+			st.ASNBuildTime = buildTime(md.BuildEpoch)
+		}
+		_ = p.next.db.Close()
+	}
+	d.mu.Lock()
+	d.lastScanAt = now
+	d.lastResult = ReloadPending
+	d.pending = st
+	d.lastError = ""
+	if count {
+		d.stats.pendingReloads++
+	}
+	d.mu.Unlock()
+}
+
+func (d *DB) generationValue() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.generation
 }
 
 // openAt loads the database at path, whose already-taken stat result is fi (the
@@ -402,10 +797,11 @@ func (d *DB) Lookup(addr netip.Addr) (Result, bool) {
 	return res, found
 }
 
-// Reload re-stats each configured path and hot-swaps any database whose
-// (mtime, size) has changed since it was opened, reporting whether anything was
-// swapped. It is what lets an operator's geoipupdate cron — or this package's
-// own downloader — rewrite the files under a running process.
+// Reload re-stats each configured path and runs the generation commit
+// boundary: with both databases configured the two files publish together only
+// when both validate in this scan (see evaluate), so an operator's geoipupdate
+// cron, a non-atomic two-file rotation, or this package's own per-edition
+// downloader can never leave lookups stitching a new country to an old ASN.
 //
 // Change detection is (mtime, size) rather than a content hash so the common
 // case (nothing changed) costs one stat per file instead of re-reading tens of
@@ -414,63 +810,19 @@ func (d *DB) Lookup(addr netip.Addr) (Result, bool) {
 // downloader renames a freshly-written file into place, so in practice mtime
 // always moves.
 //
-// A file that fails to open leaves the currently-loaded database serving. That
-// is the fail-open contract: a bad update costs freshness, never availability.
-// Errors for both databases are joined so one bad file does not hide the other.
-func (d *DB) Reload() (bool, error) {
+// Every failure mode is fail-open: a pending (incomplete pair) or failed
+// (unreadable file) scan leaves the published generation serving and retries on
+// the next tick. A failed scan's errors are joined so one bad file does not
+// hide the other.
+func (d *DB) Reload() ReloadOutcome {
 	if d == nil {
-		return false, nil
+		return ReloadOutcome{Result: ReloadUnchanged}
 	}
-	var changed bool
-	var errs []error
-
-	swap := func(path string, cur **reader, reloads *int64) {
-		if path == "" {
-			return
-		}
-		fi, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// Not an error: the scheduled download has not landed yet.
-				return
-			}
-			errs = append(errs, fmt.Errorf("stat geoip database %s: %w", path, err))
-			return
-		}
-		if *cur != nil && (*cur).mtime.Equal(fi.ModTime()) && (*cur).size == fi.Size() {
-			return
-		}
-		next, err := openAt(path, fi)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("reload geoip database: %w", err))
-			return
-		}
-		old := *cur
-		*cur = next
-		if old != nil {
-			// Safe under the write lock, and safe regardless: the reader owns a
-			// heap slice, not a mapping, so a stale reference could not fault
-			// even if one escaped.
-			// Close releases the decoded buffers; it cannot fail for an
-			// OpenBytes reader (there is no file handle or mapping to release),
-			// and there is nothing a caller could do about it if it did.
-			_ = old.db.Close()
-		}
-		*reloads++
-		changed = true
+	out := d.evaluate(d.scan(), true)
+	if out.Err != nil {
+		out.Err = fmt.Errorf("reload geoip databases: %w", out.Err)
 	}
-
-	d.mu.Lock()
-	swap(d.countryPath, &d.country, &d.stats.countryReloads)
-	swap(d.asnPath, &d.asn, &d.stats.asnReloads)
-	if len(errs) > 0 {
-		d.stats.reloadFailures += int64(len(errs))
-	}
-	d.mu.Unlock()
-
-	// errors.Join returns nil for an all-empty slice, so a clean reload reports
-	// no error, and a failure on one database never hides a failure on the other.
-	return changed, errors.Join(errs...)
+	return out
 }
 
 // Stats returns an absolute snapshot of the counters and the loaded databases'
@@ -490,8 +842,34 @@ func (d *DB) Stats() Stats {
 		CountryReloads: d.stats.countryReloads,
 		ASNReloads:     d.stats.asnReloads,
 		ReloadFailures: d.stats.reloadFailures,
+		PairReloads:    d.stats.pairPublishes,
+		PendingReloads: d.stats.pendingReloads,
+		Generation:     d.generation,
+		Paired:         d.countryPath != "" && d.asnPath != "",
+		PublishedAt:    d.publishedAt,
+		LastScanAt:     d.lastScanAt,
+		LastResult:     d.lastResult,
+		LastError:      d.lastError,
+		LastErrorAt:    d.lastErrorAt,
 		CountryPath:    d.countryPath,
 		ASNPath:        d.asnPath,
+	}
+	if d.pending != nil {
+		pc := *d.pending
+		s.Pending = &pc
+	}
+	if len(d.stats.downloads) > 0 {
+		s.Downloads = make(map[string]DownloadStatus, len(d.stats.downloads))
+		for edition, ds := range d.stats.downloads {
+			s.Downloads[edition] = DownloadStatus{
+				Updated:    ds.updated,
+				Unmodified: ds.unmodified,
+				Failures:   ds.failures,
+				LastResult: ds.lastResult,
+				LastError:  ds.lastError,
+				LastAt:     ds.lastAt,
+			}
+		}
 	}
 	if d.country != nil {
 		md := d.country.db.Metadata
@@ -518,6 +896,7 @@ func (d *DB) Report(e telemetry.Emitter) {
 	cur := d.stats
 	prev := d.reported
 	d.reported = cur
+	paired := d.countryPath != "" && d.asnPath != ""
 	countryLoaded, asnLoaded := d.country != nil, d.asn != nil
 	var countryBuild, asnBuild time.Time
 	if countryLoaded {
@@ -539,18 +918,26 @@ func (d *DB) Report(e telemetry.Emitter) {
 	delta(MetricLookups, docLookups, telemetry.Attrs{attrDatabase: databaseASN, attrResult: resultMiss}, cur.asnMisses, prev.asnMisses)
 	delta(MetricLookups, docLookups, telemetry.Attrs{attrDatabase: databaseSkipped, attrResult: resultSkipped}, cur.skipped, prev.skipped)
 
+	// Per-database swaps inside committed generations.
 	delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databaseCountry, attrResult: resultSuccess}, cur.countryReloads, prev.countryReloads)
 	delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databaseASN, attrResult: resultSuccess}, cur.asnReloads, prev.asnReloads)
-	// Reload failures are not attributable to one database without threading the
-	// path back out of Reload, and the log line already names the file. The
-	// counter's job here is "is reloading working at all", so it carries the
-	// aggregate under a database value that cannot be confused with a real one.
-	delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databaseSkipped, attrResult: resultFailure}, cur.reloadFailures, prev.reloadFailures)
+	// Failures are attributed to the file that failed to stat/read/parse.
+	delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databaseCountry, attrResult: resultFailure}, cur.countryFailures, prev.countryFailures)
+	delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databaseASN, attrResult: resultFailure}, cur.asnFailures, prev.asnFailures)
+	// Pair-level outcomes exist only with both databases configured: one
+	// generation committed, or one withheld until the pair completes.
+	if paired {
+		delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databasePair, attrResult: resultSuccess}, cur.pairPublishes, prev.pairPublishes)
+		delta(MetricReloads, docReloads, telemetry.Attrs{attrDatabase: databasePair, attrResult: resultPending}, cur.pendingReloads, prev.pendingReloads)
+	}
 
 	// Build time is a gauge of MaxMind's build date, not the download time, so
-	// it is the correct staleness signal. Omitted entirely for a database that
-	// is not loaded — a zero would read as "built in 1970" and fire every
-	// staleness alert ever written against it.
+	// it is the correct staleness signal. It follows the PUBLISHED generation:
+	// a withheld (pending or failed) update never moves it, so an alert fires
+	// against what lookups actually use, never against a file that is waiting
+	// to be committed. Omitted entirely for a database that is not loaded — a
+	// zero would read as "built in 1970" and fire every staleness alert ever
+	// written against it.
 	if countryLoaded {
 		e.Gauge(MetricBuildTime, docBuildTime.Unit, docBuildTime.Description,
 			float64(countryBuild.Unix()), telemetry.Attrs{attrDatabase: databaseCountry})
@@ -561,18 +948,43 @@ func (d *DB) Report(e telemetry.Emitter) {
 	}
 }
 
-// ObserveDownload records the outcome of one edition's download attempt. It is a
-// no-op for a nil emitter, so the updater can call it unconditionally.
+// ObserveDownload records the outcome of one edition's download attempt in the
+// per-edition tally (so the status page shows it with self-observability off)
+// and, with a non-nil emitter, as one downloads counter point. It is safe on a
+// nil DB, so the updater can call it unconditionally.
 func (d *DB) ObserveDownload(e telemetry.Emitter, edition string, res DownloadResult, err error) {
-	if e == nil {
-		return
-	}
 	result := resultUpdated
 	switch {
 	case err != nil:
 		result = resultFailure
 	case !res.Updated:
 		result = resultUnmodified
+	}
+	if d != nil {
+		d.mu.Lock()
+		ds := d.stats.downloads[edition]
+		if ds == nil {
+			ds = &downloadStats{}
+			d.stats.downloads[edition] = ds
+		}
+		ds.lastAt = time.Now()
+		ds.lastResult = result
+		switch result {
+		case resultUpdated:
+			ds.updated++
+		case resultUnmodified:
+			ds.unmodified++
+		default:
+			// The fetch error carries no credential or response body by
+			// construction (see Downloader.get); it is local operator evidence
+			// of the same class as a collector's last error on this page.
+			ds.failures++
+			ds.lastError = err.Error()
+		}
+		d.mu.Unlock()
+	}
+	if e == nil {
+		return
 	}
 	e.Counter(MetricDownloads, docDownloads.Unit, docDownloads.Description, 1,
 		telemetry.Attrs{attrEdition: edition, attrResult: result})

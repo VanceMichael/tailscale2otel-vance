@@ -235,8 +235,8 @@ func TestReport_EmitsMetrics(t *testing.T) {
 func TestCatalogMatchesEmission(t *testing.T) {
 	db := mustOpen(t, Options{CountryPath: countryDB})
 	db.Lookup(netip.MustParseAddr("81.2.69.142"))
-	if _, err := db.Reload(); err != nil {
-		t.Fatal(err)
+	if out := db.Reload(); out.Err != nil {
+		t.Fatal(out.Err)
 	}
 	rec := telemetrytest.New()
 	db.Report(rec.Emitter())

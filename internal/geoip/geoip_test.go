@@ -214,33 +214,69 @@ func TestOpen_MissingFileIsNotFatal(t *testing.T) {
 	}
 }
 
-// A file that exists but is not a MaxMind database is an Open error, unlike an
-// absent one: the operator pointed at something real and wrong, and silently
-// treating it as "not downloaded yet" would hide the mistake forever.
-func TestOpen_CorruptFileErrors(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "junk.mmdb")
-	if err := os.WriteFile(path, []byte("definitely not an mmdb"), 0o600); err != nil {
+// With BOTH databases configured, startup uses the same pair commit boundary a
+// later reload uses: a present-but-unreadable country file blocks the valid
+// ASN file too. Nothing half-loaded serves; Open still returns a usable DB and
+// reports the error (the operator pointed at something real and wrong), and
+// replacing the bad file lets the next Reload publish the complete pair.
+func TestOpen_CorruptFileBlocksPairAtStartup(t *testing.T) {
+	cpath := filepath.Join(t.TempDir(), "country.mmdb")
+	apath := filepath.Join(t.TempDir(), "asn.mmdb")
+	if err := os.WriteFile(cpath, []byte("definitely not an mmdb"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(Options{CountryPath: path, ASNPath: asnDB})
+	copyFile(t, asnDB, apath)
+	db, err := Open(Options{CountryPath: cpath, ASNPath: apath})
 	if err == nil {
-		t.Fatal("Open with a corrupt database returned nil error")
+		t.Fatal("Open with a corrupt country database returned nil error")
 	}
-	// ...but the DB is still usable, and the database that DID load keeps
-	// serving. Startup must not fail over an enrichment nicety, and the good
-	// half must not be taken down by the bad one.
 	if db == nil {
 		t.Fatal("Open returned a nil DB alongside its error")
 	}
 	t.Cleanup(db.Close)
-	if got, ok := db.Lookup(netip.MustParseAddr("1.0.0.1")); !ok || got.ASN != 15169 {
-		t.Fatalf("Lookup = %+v, ok = %v; want the ASN database still serving", got, ok)
+	if !db.Empty() {
+		t.Error("a pair committed at startup despite a corrupt half")
 	}
-	// And the corrupt path is remembered, so replacing the file recovers without
-	// a restart.
+	if s := db.Stats(); s.Generation != 0 || s.LastResult != ReloadFailed || s.LastError == "" {
+		t.Errorf("Stats after a corrupt startup = gen %d result %q err %q; want gen 0, failed, an error",
+			s.Generation, s.LastResult, s.LastError)
+	}
+	// The good half must not be taken live by the bad one — the address the
+	// fixtures share must not resolve while nothing is published.
+	if got, ok := db.Lookup(netip.MustParseAddr("89.160.20.128")); ok {
+		t.Fatalf("Lookup = %+v with no published pair; want a miss", got)
+	}
+	// Replacing the bad file recovers without a restart, and the complete pair
+	// publishes in one generation.
+	copyFile(t, countryDB, cpath)
+	out := db.Reload()
+	if out.Result != ReloadPublished || !out.Changed || out.Generation != 1 {
+		t.Fatalf("Reload after replacing the corrupt file = %+v; want published gen 1", out)
+	}
+	if got, ok := db.Lookup(netip.MustParseAddr("89.160.20.128")); !ok || got.CountryISO != "SE" || got.ASN != 29518 {
+		t.Fatalf("Lookup = %+v, ok = %v; want SE + ASN 29518 from the published pair", got, ok)
+	}
+}
+
+// With a single database configured the old independent behavior is unchanged:
+// a corrupt file is an Open error, nothing serves, and replacing it recovers.
+func TestOpen_CorruptSingleDBErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "junk.mmdb")
+	if err := os.WriteFile(path, []byte("definitely not an mmdb"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(Options{CountryPath: path})
+	if err == nil {
+		t.Fatal("Open with a corrupt database returned nil error")
+	}
+	t.Cleanup(db.Close)
+	if !db.Empty() {
+		t.Error("single corrupt database loaded")
+	}
 	copyFile(t, countryDB, path)
-	if changed, err := db.Reload(); err != nil || !changed {
-		t.Fatalf("Reload after replacing the corrupt file: changed = %v, err = %v", changed, err)
+	out := db.Reload()
+	if out.Result != ReloadPublished || !out.Changed {
+		t.Fatalf("Reload = %+v; want a published single-database swap", out)
 	}
 	if got, ok := db.Lookup(netip.MustParseAddr("81.2.69.142")); !ok || got.CountryISO != "GB" {
 		t.Fatalf("Lookup = %+v, ok = %v; want GB after the corrupt file was replaced", got, ok)
@@ -256,12 +292,12 @@ func TestReload_PicksUpANewFile(t *testing.T) {
 	}
 
 	copyFile(t, countryDB, path)
-	changed, err := db.Reload()
-	if err != nil {
-		t.Fatalf("Reload: %v", err)
+	out := db.Reload()
+	if out.Err != nil {
+		t.Fatalf("Reload: %v", out.Err)
 	}
-	if !changed {
-		t.Fatal("Reload reported no change after the file appeared")
+	if !out.Changed || out.Result != ReloadPublished {
+		t.Fatalf("Reload after the file appeared = %+v; want a published change", out)
 	}
 	if got, ok := db.Lookup(netip.MustParseAddr("81.2.69.142")); !ok || got.CountryISO != "GB" {
 		t.Fatalf("after Reload, Lookup = %+v, ok = %v; want GB", got, ok)
@@ -269,12 +305,12 @@ func TestReload_PicksUpANewFile(t *testing.T) {
 
 	// An unchanged file must not be reopened: Reload runs on a timer, and
 	// remapping an untouched 30 MB database every tick is pure waste.
-	changed, err = db.Reload()
-	if err != nil {
-		t.Fatalf("second Reload: %v", err)
+	out = db.Reload()
+	if out.Err != nil {
+		t.Fatalf("second Reload: %v", out.Err)
 	}
-	if changed {
-		t.Fatal("Reload reported a change for an untouched file")
+	if out.Changed || out.Result != ReloadUnchanged {
+		t.Fatalf("Reload over an untouched file = %+v; want unchanged", out)
 	}
 }
 
@@ -290,8 +326,9 @@ func TestReload_KeepsWorkingDBOnError(t *testing.T) {
 	if err := os.WriteFile(path, []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Reload(); err == nil {
-		t.Fatal("Reload over a corrupt file returned nil error")
+	out := db.Reload()
+	if out.Err == nil || out.Result != ReloadFailed {
+		t.Fatalf("Reload over a corrupt file = %+v; want a failure with an error", out)
 	}
 	if got, ok := db.Lookup(netip.MustParseAddr("81.2.69.142")); !ok || got.CountryISO != "GB" {
 		t.Fatalf("after a failed Reload, Lookup = %+v, ok = %v; want the previous database still serving GB", got, ok)
@@ -330,8 +367,8 @@ func TestReloadConcurrentWithLookup(t *testing.T) {
 		// Rewrite the file so each Reload actually swaps a reader in.
 		copyFile(t, countryDB, path)
 		bumpMtime(t, path)
-		if _, err := db.Reload(); err != nil {
-			t.Errorf("Reload: %v", err)
+		if out := db.Reload(); out.Err != nil {
+			t.Errorf("Reload: %v", out.Err)
 		}
 	}
 	close(stop)
@@ -374,8 +411,8 @@ func TestNilDB(t *testing.T) {
 	if !db.Empty() {
 		t.Error("nil DB Empty() = false")
 	}
-	if _, err := db.Reload(); err != nil {
-		t.Errorf("nil DB Reload: %v", err)
+	if out := db.Reload(); out.Err != nil {
+		t.Errorf("nil DB Reload: %v", out.Err)
 	}
 	db.Stats()
 	db.Close()

@@ -36,9 +36,13 @@ const (
 
 	databaseCountry = "country"
 	databaseASN     = "asn"
+	// databasePair is not a database — it labels the pair-level outcomes of
+	// the generation commit boundary (one country + one ASN publishing as a
+	// unit, or being withheld until the pair is complete).
+	databasePair = "pair"
 	// databaseSkipped is not a database — it labels the lookups that never
 	// reached one because the address was not globally routable. It rides the
-	// same counter so "how many addresses did we see, and what happened to
+	// lookups counter so "how many addresses did we see, and what happened to
 	// them" is a single query rather than a join.
 	databaseSkipped = "skipped"
 
@@ -47,6 +51,10 @@ const (
 	resultSkipped = "skipped"
 	resultSuccess = "success"
 	resultFailure = "failure"
+	// resultPending is a pair-level reload outcome: one newer file validated
+	// but the pair could not commit (a partner file was missing or not rotated
+	// in the same round), so the previously published pair keeps serving.
+	resultPending = "pending"
 	// resultUnmodified is a successful conditional request that found nothing
 	// newer — the steady state of a healthy daily updater, and worth telling
 	// apart from an update that actually replaced a file.
@@ -71,9 +79,16 @@ var (
 		Name:       MetricReloads,
 		Unit:       semconv.UnitDimensionless,
 		Instrument: metricdoc.Counter,
-		Description: "GeoIP database hot-swaps, by database and result. A `success` means a changed file on disk was " +
-			"loaded and swapped in atomically; a `failure` means the new file could not be read or parsed, in which case " +
-			"the previously loaded database keeps serving. An unchanged file is not counted at all.",
+		Description: "GeoIP database reload outcomes, by database and result. When both a country and an ASN database are " +
+			"configured they commit as ONE generation: both files must validate in the same scan, so a lookup can never " +
+			"stitch a new country database together with an old ASN database (or the reverse). `geoip.database=pair` " +
+			"carries the generation-level outcomes — `success` is a committed pair generation and `pending` means one " +
+			"newer file validated while its partner was missing or not rotated in the same round, so the complete " +
+			"previously published pair keeps serving until the next scan. `country`/`asn` `success` counts the per-file " +
+			"swaps inside committed generations, and `country`/`asn` `failure` names the present file that could not be " +
+			"stat'ed, read or parsed, which likewise leaves the previous generation in service. An unchanged file is " +
+			"not counted at all; with only one database configured, pair-level outcomes are never emitted and that " +
+			"database swaps (or fails open) independently.",
 		Attributes: []string{attrDatabase, attrResult},
 		Group:      groupGeoIP,
 	}
@@ -92,10 +107,11 @@ var (
 		Name:       MetricBuildTime,
 		Unit:       semconv.UnitSeconds,
 		Instrument: metricdoc.Gauge,
-		Description: "Unix timestamp of the loaded GeoIP database's build, per database. This is MaxMind's build date, " +
-			"not when the file was downloaded, so it is the right thing to alert staleness on: `time() - " +
+		Description: "Unix timestamp of the PUBLISHED generation's GeoIP database build, per database. This is MaxMind's " +
+			"build date, not when the file was downloaded, so it is the right thing to alert staleness on: `time() - " +
 			"tailscale_geoip_database_build_time_seconds > 14 * 86400` catches an updater that has silently stopped " +
-			"working. Absent for a database that is not loaded.",
+			"working. It never follows a withheld (pending or failed) update, so it always matches what lookups use. " +
+			"Absent for a database that is not loaded.",
 		Attributes: []string{attrDatabase},
 		Group:      groupGeoIP,
 		TimeSource: metricdoc.TimestampSource,

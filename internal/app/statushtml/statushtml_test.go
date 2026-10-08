@@ -330,6 +330,84 @@ func TestRender_RefreshMs(t *testing.T) {
 	}
 }
 
+// TestRender_GeoIPPairGeneration asserts the GeoIP card distinguishes the
+// published generation from a withheld (pending) update, names the failure,
+// and lists the per-edition download tally — every new template branch
+// executes without error and carries the actionable detail.
+func TestRender_GeoIPPairGeneration(t *testing.T) {
+	s := statusdata.Status{GeoIP: statusdata.GeoIPInfo{
+		Enabled:          true,
+		Paired:           true,
+		Generation:       3,
+		PublishedAt:      "2026-09-01T00:00:00Z",
+		LastScanAt:       "2026-09-02T06:00:00Z",
+		LastResult:       "pending",
+		CountryType:      "GeoIP2-Country",
+		CountryBuildTime: "2026-08-30T00:00:00Z",
+		ASNType:          "GeoLite2-ASN",
+		ASNBuildTime:     "2026-08-30T00:00:00Z",
+		PairReloads:      2,
+		PendingReloads:   4,
+		Pending: &statusdata.GeoIPPending{
+			At: "2026-09-02T06:00:00Z", WaitingFor: "asn", Reason: "missing",
+			ReadyCountry: true, CountryType: "GeoIP2-Country", CountryBuildTime: "2026-09-01T00:00:00Z",
+		},
+		Downloads: []statusdata.GeoIPDownload{{
+			Edition: "GeoLite2-ASN", Updated: 1, Unmodified: 5, Failures: 2,
+			LastResult: "failure", LastError: "HTTP 401 Unauthorized", LastAt: "2026-09-02T06:00:00Z",
+		}},
+	}}
+	var buf bytes.Buffer
+	if err := statushtml.Render(&buf, s); err != nil {
+		t.Fatalf("Render error: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"Published generation", "#3", "committed 2026-09-01T00:00:00Z",
+		`<span class="badge warn">pending</span>`,
+		"Update waiting for the asn database", "not present yet",
+		"GeoIP2-Country", "held",
+		"2 generations", "4 withheld pending",
+		"GeoLite2-ASN", "2 failed", "HTTP 401 Unauthorized",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("geoip section missing %q", want)
+		}
+	}
+
+	// The failed-state branch with its error line.
+	s.GeoIP.LastResult = "failed"
+	s.GeoIP.Pending = nil
+	s.GeoIP.ReloadFailures = 1
+	s.GeoIP.LastError = "open geoip database /x/asn.mmdb: invalid database"
+	buf.Reset()
+	if err := statushtml.Render(&buf, s); err != nil {
+		t.Fatalf("Render(failed) error: %v", err)
+	}
+	out = buf.String()
+	for _, want := range []string{
+		`<span class="badge err">failed</span>`,
+		"Last reload failed", "invalid database",
+		"serving the previously published pair",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("geoip failed state missing %q", want)
+		}
+	}
+
+	// A single-database configuration must not masquerade as a pair.
+	single := statusdata.Status{GeoIP: statusdata.GeoIPInfo{
+		Enabled: true, LastResult: "published", Generation: 1, CountryType: "GeoIP2-Country",
+	}}
+	buf.Reset()
+	if err := statushtml.Render(&buf, single); err != nil {
+		t.Fatalf("Render(single) error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "single database") {
+		t.Error("single-database configuration should be labeled as such")
+	}
+}
+
 // TestRender_TabbedStructure asserts the six tabs, the theme toggle, and the
 // noscript fallback are present.
 func TestRender_TabbedStructure(t *testing.T) {

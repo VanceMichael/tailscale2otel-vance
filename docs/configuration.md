@@ -682,12 +682,21 @@ process lifetime, and several times that for a City database. The files are read
 than memory-mapped on purpose - truncating a mapped database (a plain `curl -o` over the old file,
 say) faults every in-flight lookup and kills the process.
 
+**When both paths are configured the two databases publish as one generation.** A reload (startup,
+the reload tick, or a download round) swaps in a new pair only when BOTH files validate in the same
+scan. If one file is new while the other is corrupt, missing mid-rotation, or simply not rotated in
+the same round, the newer file is withheld and the complete previously published pair keeps serving -
+a lookup can never combine a new country database with an old ASN database. The next scan retries and
+commits automatically once both halves are ready; the admin status page shows the published
+generation, the held update and the failure. With only one path configured, that database swaps
+independently as before.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enrichment.geoip.enabled` | `false` | Turn on geo/ASN enrichment. |
 | `enrichment.geoip.country_database` | `""` | Path to a GeoLite2/GeoIP2 **Country** `.mmdb`. A **City** database is also accepted - it is a superset, and supplying one additionally fills locality, region and coordinates on flow logs. Defaults to the downloader's install path when `download.enabled` is set. |
 | `enrichment.geoip.asn_database` | `""` | Path to a GeoLite2/GeoIP2 **ASN** `.mmdb`. Defaults to the downloader's install path when `download.enabled` is set. |
-| `enrichment.geoip.reload_interval` | `6h` | Re-stat the database paths and hot-swap a changed file. This is what makes an externally-managed database work - a `geoipupdate` cron, an init container, a mounted volume. `0` disables it. |
+| `enrichment.geoip.reload_interval` | `6h` | Re-stat the database paths and hot-swap changed files as one pair generation. This is what makes an externally-managed database work - a `geoipupdate` cron, an init container, a mounted volume. `0` disables periodic reloading (the downloader's own rounds still reload). |
 | `enrichment.geoip.acknowledge_cardinality` | `false` | Set `true` (once `cardinality.metric_limit` is sized) to silence the advisory that fires when `cardinality.flow.geo_dims` puts country labels on the **raw** flow-metric families. |
 | `enrichment.geoip.download.enabled` | `false` | Fetch databases from MaxMind directly, so no sidecar is needed. |
 | `enrichment.geoip.download.account_id` | `""` | MaxMind account ID. A free GeoLite2 account is enough. |

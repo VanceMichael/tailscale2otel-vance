@@ -1,11 +1,14 @@
 package app
 
 import (
+	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rknightion/tailscale2otel/v5/internal/config"
 	"github.com/rknightion/tailscale2otel/v5/internal/geoip"
@@ -85,6 +88,86 @@ func TestGeoipInfo(t *testing.T) {
 	}
 	if !info.GeoDims {
 		t.Error("GeoDims = false; the status page must show that country labels are on flow metrics")
+	}
+}
+
+// The status snapshot distinguishes the published pair from a withheld update
+// and its reason, and carries the per-edition download tally, so an operator
+// can see all three states without self-observability.
+func TestGeoipInfo_PairGenerationStates(t *testing.T) {
+	dir := t.TempDir()
+	cpath := filepath.Join(dir, "country.mmdb")
+	apath := filepath.Join(dir, "asn.mmdb")
+	writeCopy := func(dst, src string) {
+		t.Helper()
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCopy(cpath, "../geoip/testdata/GeoIP2-Country-Test.mmdb")
+	writeCopy(apath, "../geoip/testdata/GeoLite2-ASN-Test.mmdb")
+
+	a := &App{cfg: config.Default(), logger: testLogger()}
+	a.cfg.Enrichment.GeoIP.Enabled = true
+	a.cfg.Enrichment.GeoIP.CountryDatabase = cpath
+	a.cfg.Enrichment.GeoIP.ASNDatabase = apath
+	a.buildGeoIP()
+	t.Cleanup(a.geoDB.Close)
+
+	info := a.geoipInfo()
+	if !info.Paired || info.Generation != 1 || info.LastResult != "published" || info.PublishedAt == "" {
+		t.Fatalf("initial info = paired %v gen %d result %q publishedAt %q; want paired published gen 1",
+			info.Paired, info.Generation, info.LastResult, info.PublishedAt)
+	}
+	if info.CountryBuildTime == "" || info.ASNBuildTime == "" {
+		t.Fatal("both published build times must be shown")
+	}
+
+	// Half rotation: newer country, asn deleted → pending, and the published
+	// build times must still describe generation 1 (what lookups use).
+	writeCopy(cpath, "../geoip/testdata/GeoIP2-Country-Test.mmdb")
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(cpath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(apath); err != nil {
+		t.Fatal(err)
+	}
+	if r := a.geoDB.Reload(); r.Result != geoip.ReloadPending {
+		t.Fatalf("Reload = %+v; want pending", r)
+	}
+	info = a.geoipInfo()
+	if info.LastResult != "pending" || info.Pending == nil {
+		t.Fatalf("info result %q pending %+v; want pending detail", info.LastResult, info.Pending)
+	}
+	if info.Pending.WaitingFor != "asn" || info.Pending.Reason != "missing" || !info.Pending.ReadyCountry {
+		t.Errorf("Pending = %+v; want a held country waiting for a missing asn", info.Pending)
+	}
+	if info.Pending.CountryType != "GeoIP2-Country" || info.Pending.CountryBuildTime == "" {
+		t.Errorf("held candidate identity = %q %q", info.Pending.CountryType, info.Pending.CountryBuildTime)
+	}
+	if info.Generation != 1 || info.PendingReloads != 1 || info.PairReloads != 0 {
+		t.Errorf("generation/counters = gen %d pending %d pair %d; want gen 1, 1, 0",
+			info.Generation, info.PendingReloads, info.PairReloads)
+	}
+	if info.CountryBuildTime == "" || info.ASNBuildTime == "" {
+		t.Error("published build times vanished while an update is pending")
+	}
+
+	// A failed edition on the download side shows up per edition, ready to
+	// correlate with the pending pair.
+	a.geoDB.ObserveDownload(nil, "GeoLite2-ASN", geoip.DownloadResult{}, errors.New("HTTP 401 Unauthorized"))
+	info = a.geoipInfo()
+	if len(info.Downloads) != 1 {
+		t.Fatalf("Downloads = %+v; want one edition row", info.Downloads)
+	}
+	d := info.Downloads[0]
+	if d.Edition != "GeoLite2-ASN" || d.Failures != 1 || d.LastResult != "failure" || d.LastError != "HTTP 401 Unauthorized" {
+		t.Errorf("download row = %+v", d)
 	}
 }
 

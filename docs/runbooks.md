@@ -414,10 +414,20 @@ Triage in this order:
    disk is never picked up until a restart. The status page shows the loaded build time, which will
    disagree with the file on disk in that case.
 
-Reloading is failure-tolerant by design: a database that cannot be read leaves the previously loaded
-one serving, and `tailscale_geoip_reloads_total{result="failure"}` plus a WARN naming the file is the
-only symptom. That is deliberate - degraded enrichment must never become a degraded exporter - but it
-does mean a broken file can sit there indefinitely while everything looks fine except this rule.
+Reloading is failure-tolerant by design, and when BOTH a country and an ASN database are configured
+they commit as ONE generation. A reload scan publishes only when both files validate together: a
+newer file next to a partner that is corrupt, missing (a rotation or download halfway through) or
+simply not rotated in the same round is withheld. The complete previously published pair keeps
+serving - lookups can never stitch a new country to an old ASN - and the scan retries on the next
+reload tick, committing automatically once both halves are ready. The status page's GeoIP card shows
+which generation is published, the held candidate (`pending`, with the partner it waits for and the
+reason), and the verbatim failure; the counters are `tailscale_geoip_reloads_total{geoip_database="pair",result="success|pending"}`
+for the generation outcomes, `{geoip_database="country|asn",result="success"}` for the per-file swaps
+inside them, and `{geoip_database="country|asn",result="failure"}` naming the file that could not be
+read or parsed. With only one database configured it swaps independently, as before. That is
+deliberate - degraded enrichment must never become a degraded exporter - but it does mean a broken or
+half-rotated pair can sit withheld indefinitely while everything looks fine except this rule and the
+status card.
 
 **First step.** **Enrich cache age** and **Enrich cache size** on the **Collection** tab of
 `tailscale2otel-health`. If the age is climbing, check the devices collector's scrape success. For

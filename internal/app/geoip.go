@@ -28,10 +28,11 @@ func (a *App) buildGeoIP() {
 		ASNPath:     g.ASNDatabase,
 	})
 	if err != nil {
-		// Open only reports a file that is present and unusable, and it still
-		// returns a working DB: whatever loaded is serving, and the paths are
-		// retained so the reload tick picks the bad one up once it is replaced.
-		logger.Warn("a geoip database could not be loaded; that database's attributes will be absent until it is replaced",
+		// Open only reports a present, unusable file, and it still returns a
+		// working DB. With both paths configured the bad half blocks the good
+		// one too (one commit boundary); the paths are retained so the reload
+		// tick publishes the complete pair once the bad file is replaced.
+		logger.Warn("a geoip database could not be loaded; no half-loaded pair is serving, and the reload tick will publish both databases once the bad file is replaced",
 			"error", err)
 	}
 	a.geoDB = db
@@ -64,9 +65,19 @@ func (a *App) buildGeoIP() {
 	a.geoUpdater = geoip.NewUpdater(opts)
 
 	if a.geoDB.Empty() && !g.Download.Enabled {
-		logger.Warn("geoip is enabled but no database is loaded yet; flow records will carry no geo attributes",
+		args := []any{
 			"country_database", g.CountryDatabase, "asn_database", g.ASNDatabase,
-			"reload_interval", g.ReloadInterval.D())
+			"reload_interval", g.ReloadInterval.D(),
+		}
+		// With both paths configured one present file next to a missing partner
+		// is withheld as a pending pair rather than half-loaded; say which half
+		// the operator still owes the process.
+		if s := a.geoDB.Stats(); s.Pending != nil {
+			logger.Warn("geoip is enabled but the database pair is not complete; flow records will carry no geo attributes until both files validate in one scan",
+				append(args, "waiting_for", s.Pending.WaitingFor, "reason", s.Pending.Reason)...)
+		} else {
+			logger.Warn("geoip is enabled but no database is loaded yet; flow records will carry no geo attributes", args...)
+		}
 	}
 }
 

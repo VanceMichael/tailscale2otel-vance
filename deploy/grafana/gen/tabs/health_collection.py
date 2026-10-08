@@ -44,6 +44,9 @@ from maps import bool_map, UP_MAP
 _RDNS_EMPTY = ("No reverse-DNS cache series. Requires enrichment.reverse_dns.enabled and "
                "self_observability.enabled.")
 
+_RDNS_SNAPSHOT_EMPTY = ("No rDNS snapshot-persistence series. Requires a configured checkpoint "
+                        "file path and self_observability.enabled.")
+
 
 _PULL_EMPTY = ("No Prometheus pull-endpoint series. Requires prometheus.enabled and at least "
                "one scrape against the exporter's /metrics endpoint.")
@@ -399,6 +402,28 @@ def tab_health_collection(scope):
                     "because the cache was already at enrichment.reverse_dns.max_entries — the "
                     "address is simply never resolved. Read it against the accepted lookup rate: a "
                     "sustained non-zero share means max_entries is too small."), 24, 6),
+        # Warm-start snapshot durability. The age series (time since the last
+        # successful write) climbs while writes fail; consecutive failures is
+        # the current outage length (heals on recovery); pending generations is
+        # how much in-memory state a restart would lose; the failures/s counter
+        # is the cumulative blip rate. A failed write never disables persistence:
+        # the next report tick, purge, or close retries.
+        (panel("rDNS snapshot durability", "timeseries",
+               [prom_t("time() - max(tailscale_rdns_snapshot_last_success_seconds)",
+                       legend="snapshot age (s since last success)"),
+                prom_t("max(tailscale_rdns_snapshot_consecutive_failures_ratio)",
+                       legend="consecutive persist failures", refid="B"),
+                prom_t("max(tailscale_rdns_snapshot_pending_generations_ratio)",
+                       legend="generations awaiting persist", refid="C"),
+                prom_t("sum(rate(tailscale_rdns_snapshot_persist_failures_total[%s]))" % RI,
+                       legend="persist failures/s", refid="D")],
+               unit="s", custom=ts_custom(), options=ts_opts(), novalue=_RDNS_SNAPSHOT_EMPTY,
+               desc="Warm-start sidecar health: seconds since the last complete snapshot reached "
+                    "disk, the current run of consecutive failed writes (0 = the last write "
+                    "succeeded), the number of cache mutations still awaiting a durable write, "
+                    "and the cumulative failed-write rate. A non-zero age with pending generations "
+                    "means a restart would cold-start those PTR names; writes retry automatically "
+                    "once storage recovers. Only present when a checkpoint sidecar is configured."), 24, 6),
     ]
 
     pertailnet = [

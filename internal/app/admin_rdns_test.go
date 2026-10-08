@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -147,9 +148,10 @@ func TestStatusPage_HasRDNSSection(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, want := range []string{
-		`data-tab="inventory"`, // reverse-DNS now lives under the Inventory & Catalog tab
-		`id="rdnsPurgeBtn"`,    // the purge control
-		"Reverse DNS",          // section heading text
+		`data-tab="inventory"`,    // reverse-DNS now lives under the Inventory & Catalog tab
+		`id="rdnsPurgeBtn"`,       // the purge control
+		`id="rdnsSnapshotState"`,  // the warm-start snapshot status card
+		"Reverse DNS",             // section heading text
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("status HTML missing %q", want)
@@ -165,6 +167,60 @@ func TestBuildStatus_IncludesRDNS(t *testing.T) {
 	}
 	if s.RDNS.Capacity != 100 {
 		t.Errorf("status.RDNS.Capacity = %d, want 100", s.RDNS.Capacity)
+	}
+	// rdnsTestApp's cache is memory-only (no checkpoint path): the snapshot
+	// section must say so rather than inventing durability.
+	if s.RDNS.SnapshotEnabled {
+		t.Error("status.RDNS.SnapshotEnabled = true, want false with no checkpoint sidecar")
+	}
+	if s.RDNS.SnapshotFailures != 0 || s.RDNS.SnapshotPendingGenerations != 0 || s.RDNS.SnapshotLastSuccess != "" {
+		t.Errorf("memory-only RDNS snapshot fields = failures:%d pending:%d lastSuccess:%q, want zero",
+			s.RDNS.SnapshotFailures, s.RDNS.SnapshotPendingGenerations, s.RDNS.SnapshotLastSuccess)
+	}
+
+	// With a sidecar that has a complete snapshot on disk, status reports the
+	// warm-start durability state (enabled, a last-success time from mtime,
+	// nothing pending, no failure run).
+	path := filepath.Join(t.TempDir(), "rdns.json")
+	seed := rdns.New(rdns.Options{
+		MaxEntries:     100,
+		ReportInterval: time.Hour,
+		SnapshotPath:   path,
+		Lookup: func(context.Context, netip.Addr) ([]string, error) {
+			return []string{"warm.example.com."}, nil
+		},
+	})
+	seed.LookupName(netip.MustParseAddr("203.0.113.66"))
+	deadline := time.Now().Add(2 * time.Second)
+	for seed.Stats().Size == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for seed rdns entry")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	seed.Close()
+
+	a.rdnsCache.Close()
+	a.rdnsCache = rdns.New(rdns.Options{
+		MaxEntries:     100,
+		ReportInterval: time.Hour,
+		SnapshotPath:   path,
+		Lookup: func(context.Context, netip.Addr) ([]string, error) {
+			return nil, context.Canceled
+		},
+	})
+	t.Cleanup(func() { a.rdnsCache.Close() })
+
+	s = a.buildStatus()
+	if !s.RDNS.SnapshotEnabled {
+		t.Error("status.RDNS.SnapshotEnabled = false, want true with a checkpoint sidecar")
+	}
+	if s.RDNS.SnapshotLastSuccess == "" {
+		t.Error("status.RDNS.SnapshotLastSuccess empty, want the loaded snapshot's mtime")
+	}
+	if s.RDNS.SnapshotFailures != 0 || s.RDNS.SnapshotPendingGenerations != 0 {
+		t.Errorf("warm RDNS snapshot = failures:%d pending:%d, want 0/0",
+			s.RDNS.SnapshotFailures, s.RDNS.SnapshotPendingGenerations)
 	}
 
 	// With reverse_dns disabled the section reports disabled.

@@ -375,6 +375,19 @@ type RDNSInfo struct {
 	Overflows      int64   `json:"overflows"`
 	HitRatePct     float64 `json:"hit_rate_pct"`
 	LastPurge      string  `json:"last_purge,omitempty"` // RFC3339
+	// Warm-start snapshot durability. SnapshotEnabled is false when no
+	// checkpoint-adjacent sidecar path is configured (the cache is then
+	// memory-only). SnapshotLastSuccess is RFC3339 time of the last completed
+	// write (seeded from the loaded file's mtime after a warm start).
+	// SnapshotFailures is the CURRENT run of consecutive failed writes;
+	// SnapshotPendingGenerations is how far in-memory state is ahead of the
+	// last durable snapshot; SnapshotLastError is the most recent failure's
+	// error text.
+	SnapshotEnabled            bool   `json:"snapshot_enabled"`
+	SnapshotLastSuccess        string `json:"snapshot_last_success,omitempty"` // RFC3339
+	SnapshotFailures           int64  `json:"snapshot_failures"`
+	SnapshotPendingGenerations uint64 `json:"snapshot_pending_generations"`
+	SnapshotLastError          string `json:"snapshot_last_error,omitempty"`
 }
 
 // GeoIPInfo summarizes the local GeoIP/ASN enrichment databases. Enabled is

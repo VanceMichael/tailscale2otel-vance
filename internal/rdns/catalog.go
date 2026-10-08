@@ -26,6 +26,30 @@ const (
 	MetricOverflows = "tailscale.rdns.cache.overflows"
 	MetricEntries   = "tailscale.rdns.cache.entries"
 	MetricCapacity  = "tailscale.rdns.cache.capacity"
+
+	// MetricSnapshotPersistFailures is the cumulative counter of warm-start
+	// snapshot persist attempts that failed (an unwritable checkpoint
+	// directory, a sync/rename error, or an over-bounds serialization). A
+	// failure never switches persistence off: the cache stays dirty and the
+	// next report tick, purge, or close retries, so this counter rising while
+	// the consecutive-failures gauge returns to zero is a transient storage
+	// blip, not a stuck cache.
+	MetricSnapshotPersistFailures = "tailscale.rdns.snapshot.persist_failures"
+	// MetricSnapshotConsecutiveFailures is the length of the CURRENT run of
+	// failed persist attempts (0 when the last attempt succeeded). Unlike the
+	// counter, it heals on recovery, so it is the gauge to alert on for a
+	// snapshot that has stopped landing.
+	MetricSnapshotConsecutiveFailures = "tailscale.rdns.snapshot.consecutive_failures"
+	// MetricSnapshotPendingGenerations is how many cache mutations the last
+	// durable snapshot is behind: 0 immediately after a successful write with
+	// nothing racing it, >0 while a write is failing or a mutation landed
+	// mid-write. A persistently positive value means a restart would cold-start
+	// some names.
+	MetricSnapshotPendingGenerations = "tailscale.rdns.snapshot.pending_generations"
+	// MetricSnapshotLastSuccess is the Unix timestamp (seconds) of the most
+	// recent successful snapshot write, seeded from the loaded file's mtime
+	// after a warm start. The series is absent until the first success.
+	MetricSnapshotLastSuccess = "tailscale.rdns.snapshot.last_success"
 )
 
 // Attribute keys (closed sets keep cardinality bounded).
@@ -99,11 +123,42 @@ var (
 		Description: "Configured maximum number of entries (enrichment.reverse_dns.max_entries).",
 		Group:       groupRDNS,
 	}
+	docSnapshotPersistFailures = metricdoc.Metric{
+		Name:       MetricSnapshotPersistFailures,
+		Unit:       semconv.UnitDimensionless,
+		Instrument: metricdoc.Counter,
+		Description: "Cumulative number of warm-start snapshot persist attempts that failed (for example, the checkpoint directory was briefly unwritable). A failure never disables persistence: the snapshot stays dirty and the next report tick, purge, or close retries, so pair this with the consecutive-failures gauge to tell a recovered blip from an ongoing outage.",
+		Group:      groupRDNS,
+	}
+	docSnapshotConsecutiveFailures = metricdoc.Metric{
+		Name:       MetricSnapshotConsecutiveFailures,
+		Unit:       semconv.UnitDimensionless,
+		Instrument: metricdoc.Gauge,
+		Description: "Length of the current run of consecutive snapshot persist failures, reset to 0 by the next successful write. A non-zero value means the latest cache state is not yet durable and a restart would cold-start it.",
+		Group:      groupRDNS,
+	}
+	docSnapshotPendingGenerations = metricdoc.Metric{
+		Name:       MetricSnapshotPendingGenerations,
+		Unit:       semconv.UnitDimensionless,
+		Instrument: metricdoc.Gauge,
+		Description: "How many cache mutations the last durable snapshot is behind: 0 right after a successful write with no mutation racing it, positive while a write is failing or resolutions arrived during the write. Only emitted when a checkpoint-adjacent snapshot path is configured.",
+		Group:      groupRDNS,
+	}
+	docSnapshotLastSuccess = metricdoc.Metric{
+		Name:        MetricSnapshotLastSuccess,
+		Unit:        semconv.UnitSeconds,
+		Instrument:  metricdoc.Gauge,
+		Description: "Unix timestamp (seconds) of the most recent successful warm-start snapshot write, seeded from the loaded file's mtime after a restart. Absent until the first success; derive age with time()-it.",
+		Group:       groupRDNS,
+		TimeSource:  metricdoc.TimestampProcessLocal,
+	}
 )
 
 // Catalog returns the metrics this package emits, for the doc generator.
 func Catalog() []metricdoc.Metric {
 	return []metricdoc.Metric{
 		docLookups, docQueries, docRefreshes, docEvictions, docOverflows, docEntries, docCapacity,
+		docSnapshotPersistFailures, docSnapshotConsecutiveFailures, docSnapshotPendingGenerations,
+		docSnapshotLastSuccess,
 	}
 }

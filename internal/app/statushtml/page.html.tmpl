@@ -685,6 +685,7 @@ a.cta:hover{background:var(--t2o-hover);filter:none}
       <div class="card"><div class="k">Overflows</div><div class="v" id="rdnsOverflows">{{.RDNS.Overflows}}</div><div class="sub">at-capacity drops{{if .RDNS.Overflows}} — raise max_entries{{end}}</div></div>
       <div class="card"><div class="k">Evictions</div><div class="v" id="rdnsEvicted">{{add64 .RDNS.EvictedExpired .RDNS.EvictedPurged}}</div><div class="sub">expired <span id="rdnsEvictedExpired">{{.RDNS.EvictedExpired}}</span> · purged <span id="rdnsEvictedPurged">{{.RDNS.EvictedPurged}}</span></div></div>
       <div class="card"><div class="k">TTL</div><div class="v" style="font-size:16px">{{.RDNS.TTL}}</div><div class="sub">negative {{.RDNS.NegativeTTL}}</div></div>
+      <div class="card" id="rdnsSnapshotCard"{{if and .RDNS.SnapshotEnabled .RDNS.SnapshotLastError}} title="{{.RDNS.SnapshotLastError}}"{{end}}><div class="k">Warm-start snapshot</div><div class="v" style="font-size:14px" id="rdnsSnapshotState">{{if .RDNS.SnapshotEnabled}}{{if .RDNS.SnapshotLastSuccess}}{{.RDNS.SnapshotLastSuccess}}{{else}}never written{{end}}{{else}}memory-only{{end}}</div><div class="sub"><span id="rdnsSnapshotHealth"{{if .RDNS.SnapshotFailures}} style="color:var(--warn)"{{end}}>{{if .RDNS.SnapshotEnabled}}{{if .RDNS.SnapshotFailures}}{{.RDNS.SnapshotFailures}} failed persist(s) — retries automatically{{else}}up to date{{end}}{{else}}no checkpoint sidecar configured{{end}}</span><span id="rdnsSnapshotPendingWrap"{{if not .RDNS.SnapshotEnabled}} style="display:none"{{end}}> · <span id="rdnsSnapshotPending">{{.RDNS.SnapshotPendingGenerations}}</span> gen pending</span></div></div>
     </div>
     <div class="controls" style="margin-top:12px">
       <button class="ctl" id="rdnsPurgeBtn">Purge cache</button>
@@ -1732,6 +1733,34 @@ function updateRDNS(r){
   setText('rdnsOverflows', r.overflows);
   setText('rdnsEvicted', (r.evicted_expired||0)+(r.evicted_purged||0));
   setText('rdnsEvictedExpired', r.evicted_expired); setText('rdnsEvictedPurged', r.evicted_purged);
+  var snapState=document.getElementById('rdnsSnapshotState');
+  var snapHealth=document.getElementById('rdnsSnapshotHealth');
+  var snapPendingWrap=document.getElementById('rdnsSnapshotPendingWrap');
+  var snapCard=document.getElementById('rdnsSnapshotCard');
+  if(snapState&&snapHealth){
+    if(!r.snapshot_enabled){
+      snapState.textContent='memory-only';
+      snapHealth.textContent='no checkpoint sidecar configured';
+      snapHealth.style.color='';
+      if(snapPendingWrap) snapPendingWrap.style.display='none';
+      if(snapCard) snapCard.removeAttribute('title');
+    }else{
+      if(snapPendingWrap) snapPendingWrap.style.display='';
+      snapState.textContent=r.snapshot_last_success||'never written';
+      setText('rdnsSnapshotPending', r.snapshot_pending_generations||0);
+      if(r.snapshot_failures>0){
+        snapHealth.textContent=r.snapshot_failures+' failed persist(s) — retries automatically';
+        snapHealth.style.color='var(--warn)';
+      }else{
+        snapHealth.textContent='up to date';
+        snapHealth.style.color='';
+      }
+      if(snapCard){
+        if(r.snapshot_last_error) snapCard.setAttribute('title', r.snapshot_last_error);
+        else snapCard.removeAttribute('title');
+      }
+    }
+  }
 }
 function purgeRDNS(){
   if(!confirm('Purge the reverse-DNS cache? Cached PTR names will be re-resolved on the next sighting.')) return;

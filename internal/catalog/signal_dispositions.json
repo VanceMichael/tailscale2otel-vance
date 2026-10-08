@@ -1944,6 +1944,42 @@
     },
     {
       "kind": "metric",
+      "name": "tailscale.rdns.snapshot.consecutive_failures",
+      "prom_name": "tailscale_rdns_snapshot_consecutive_failures_ratio",
+      "surface": "operational",
+      "dispositions": [
+        "visualized"
+      ]
+    },
+    {
+      "kind": "metric",
+      "name": "tailscale.rdns.snapshot.last_success",
+      "prom_name": "tailscale_rdns_snapshot_last_success_seconds",
+      "surface": "operational",
+      "dispositions": [
+        "visualized"
+      ]
+    },
+    {
+      "kind": "metric",
+      "name": "tailscale.rdns.snapshot.pending_generations",
+      "prom_name": "tailscale_rdns_snapshot_pending_generations_ratio",
+      "surface": "operational",
+      "dispositions": [
+        "visualized"
+      ]
+    },
+    {
+      "kind": "metric",
+      "name": "tailscale.rdns.snapshot.persist_failures",
+      "prom_name": "tailscale_rdns_snapshot_persist_failures_total",
+      "surface": "operational",
+      "dispositions": [
+        "visualized"
+      ]
+    },
+    {
+      "kind": "metric",
       "name": "tailscale.service.host.info",
       "prom_name": "tailscale_service_host_info_ratio",
       "surface": "operational",

@@ -80,6 +80,7 @@ type stats struct {
 	evictExpired, evictPurged   int64
 	evictStaleExpired           int64
 	overflows                   int64
+	snapshotPersistErrors       int64
 	lastPurge                   time.Time
 }
 
@@ -99,6 +100,21 @@ type Stats struct {
 	TTL, NegativeTTL        time.Duration
 	StaleTTL                time.Duration
 	LastPurge               time.Time // zero when never purged
+
+	// Snapshot durability bookkeeping. SnapshotEnabled is false for a
+	// memory-only cache (no checkpoint-adjacent sidecar configured); the rest
+	// are then zero. SnapshotLastSuccess is when the sidecar was last
+	// successfully written (seeded from the loaded file's mtime after a warm
+	// start); SnapshotFailures is the CURRENT run of consecutive failed
+	// persist attempts, reset to zero by any success — not a lifetime total;
+	// SnapshotPendingGenerations is how far the in-memory cache is ahead of the
+	// last durable snapshot (0 means the last write captured everything).
+	// SnapshotLastError describes the most recent failed attempt.
+	SnapshotEnabled            bool
+	SnapshotLastSuccess        time.Time
+	SnapshotFailures           int64
+	SnapshotPendingGenerations uint64
+	SnapshotLastError          string
 }
 
 type entry struct {
@@ -119,13 +135,21 @@ type Cache struct {
 	emitter      telemetry.Emitter
 	reportEvery  time.Duration
 	snapshotPath string
-	snapshotMu   sync.Mutex
-	snapshotOff  bool // set after a persistence failure; state is best-effort
-	// snapshotDirty and snapshotGeneration are guarded by mu. The generation
-	// lets a completed write clear dirty only when no newer cache mutation raced
-	// it.
-	snapshotDirty      bool
-	snapshotGeneration uint64
+	snapshotMu   sync.Mutex // serializes snapshot captures and writes
+	// Snapshot bookkeeping, all guarded by mu. snapshotGeneration advances once
+	// per cache mutation while a sidecar is configured; snapshotPersistedGen is
+	// the generation the last SUCCESSFUL write captured. The cache is "dirty"
+	// whenever the two differ, so a write that lands while newer mutations are
+	// in flight marks only its OWN generation durable and leaves the newer one
+	// pending — a stale capture can never mark newer state as persisted. A
+	// persist failure advances nothing: the run of failures is counted in
+	// snapshotFailures and the next report tick, Purge, or Close retries.
+	snapshotGeneration   uint64
+	snapshotPersistedGen uint64
+	snapshotLastSuccess  time.Time
+	snapshotFailures     int64 // consecutive failures since the last success
+	snapshotLastError    string
+	// snapshotPersistErrors also lives in stats (counter deltas for report()).
 
 	mu       sync.Mutex
 	entries  map[netip.Addr]entry
@@ -456,7 +480,7 @@ func (c *Cache) Purge() int {
 func (c *Cache) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return Stats{
+	s := Stats{
 		Size:                len(c.entries),
 		Capacity:            c.max,
 		Hits:                c.stats.hits,
@@ -475,7 +499,15 @@ func (c *Cache) Stats() Stats {
 		NegativeTTL:         c.negTTL,
 		StaleTTL:            c.staleTTL,
 		LastPurge:           c.stats.lastPurge,
+		SnapshotLastSuccess: c.snapshotLastSuccess,
+		SnapshotFailures:    c.snapshotFailures,
+		SnapshotLastError:   c.snapshotLastError,
 	}
+	if c.snapshotPath != "" {
+		s.SnapshotEnabled = true
+		s.SnapshotPendingGenerations = c.snapshotGeneration - c.snapshotPersistedGen
+	}
+	return s
 }
 
 // report flushes the cumulative counters as OTEL counter deltas (since the last
@@ -492,6 +524,13 @@ func (c *Cache) report() {
 	c.reported = cur
 	size := float64(len(c.entries))
 	capacity := float64(c.max)
+	snapshotConfigured := c.snapshotPath != ""
+	snapshotFailures := c.snapshotFailures
+	snapshotPending := uint64(0)
+	if snapshotConfigured {
+		snapshotPending = c.snapshotGeneration - c.snapshotPersistedGen
+	}
+	snapshotLastSuccess := c.snapshotLastSuccess
 	c.mu.Unlock()
 
 	emitDelta := func(metric, unit, desc, key, val string, now, before int64) {
@@ -515,6 +554,28 @@ func (c *Cache) report() {
 	}
 	c.emitter.Gauge(MetricEntries, docEntries.Unit, docEntries.Description, size, nil)
 	c.emitter.Gauge(MetricCapacity, docCapacity.Unit, docCapacity.Description, capacity, nil)
+
+	// Snapshot durability signals exist only when a sidecar is configured; a
+	// memory-only cache emits nothing for them. The failure counter rides the
+	// same delta machinery as the other counters, so a retried-then-recovered
+	// outage shows one increment rather than a stuck gauge.
+	if !snapshotConfigured {
+		return
+	}
+	if d := cur.snapshotPersistErrors - prev.snapshotPersistErrors; d > 0 {
+		c.emitter.Counter(MetricSnapshotPersistFailures, docSnapshotPersistFailures.Unit,
+			docSnapshotPersistFailures.Description, float64(d), nil)
+	}
+	c.emitter.Gauge(MetricSnapshotConsecutiveFailures, docSnapshotConsecutiveFailures.Unit,
+		docSnapshotConsecutiveFailures.Description, float64(snapshotFailures), nil)
+	c.emitter.Gauge(MetricSnapshotPendingGenerations, docSnapshotPendingGenerations.Unit,
+		docSnapshotPendingGenerations.Description, float64(snapshotPending), nil)
+	// The timestamp series is absent until the first success (rather than 0,
+	// which would read as 1970); age panels derive time()-it once it appears.
+	if !snapshotLastSuccess.IsZero() {
+		c.emitter.Gauge(MetricSnapshotLastSuccess, docSnapshotLastSuccess.Unit,
+			docSnapshotLastSuccess.Description, float64(snapshotLastSuccess.Unix()), nil)
+	}
 }
 
 // Close cancels outstanding lookups and waits for the background workers to

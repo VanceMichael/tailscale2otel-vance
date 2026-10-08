@@ -3,6 +3,7 @@ package rdns
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -47,13 +48,20 @@ type diskSnapshotEntry struct {
 }
 
 // markSnapshotDirtyLocked records a cache mutation for the next periodic or
-// lifecycle flush. Callers must hold c.mu.
+// lifecycle flush. Every mutation advances the generation; the generation
+// captured by the last successful write (snapshotPersistedGen) is what decides
+// whether newer state still owes a flush. Callers must hold c.mu.
 func (c *Cache) markSnapshotDirtyLocked() {
 	if c.snapshotPath == "" {
 		return
 	}
-	c.snapshotDirty = true
 	c.snapshotGeneration++
+}
+
+// snapshotDirtyLocked reports whether the in-memory cache is ahead of the last
+// durable snapshot. Callers must hold c.mu.
+func (c *Cache) snapshotDirtyLocked() bool {
+	return c.snapshotGeneration != c.snapshotPersistedGen
 }
 
 // loadSnapshot is deliberately fail-open. The cache is an enrichment, not a
@@ -63,7 +71,7 @@ func (c *Cache) loadSnapshot() {
 	if c.snapshotPath == "" {
 		return
 	}
-	data, err := safefile.ReadRegular(c.snapshotPath, maxSnapshotBytes, safefile.NoSymlink)
+	data, info, err := safefile.ReadRegularInfo(c.snapshotPath, maxSnapshotBytes, safefile.NoSymlink)
 	if err != nil || len(data) == 0 {
 		return
 	}
@@ -96,6 +104,12 @@ func (c *Cache) loadSnapshot() {
 		entries[addr] = entry{name: persisted.Name, expires: persisted.Expires}
 	}
 	c.entries = entries
+	// The file's mtime IS the last successful atomic replace (the rename is the
+	// last content-changing step), so it honestly seeds "last successful
+	// snapshot" across a restart without putting a timestamp in the wire format.
+	// Generation starts at 0 on both sides, so the loaded state is considered
+	// durable and is not needlessly rewritten by the first report tick.
+	c.snapshotLastSuccess = info.ModTime()
 }
 
 func (c *Cache) snapshotEntryLimit() int {
@@ -122,14 +136,17 @@ func validSnapshotName(name string) bool {
 }
 
 // persistSnapshotIfDirty avoids rewriting an unchanged sidecar on every report
-// tick. It is intentionally only a hint: a mutation racing this check remains
-// dirty and is picked up by the next tick or lifecycle flush.
+// tick. "Dirty" is a generation the last successful write did not capture: a
+// failed attempt leaves it dirty, so a transiently unwritable directory is
+// retried on every subsequent tick once storage recovers, with no restart
+// needed. A mutation racing this check likewise stays dirty and is picked up
+// by the next tick or lifecycle flush.
 func (c *Cache) persistSnapshotIfDirty() {
 	if c.snapshotPath == "" {
 		return
 	}
 	c.mu.Lock()
-	dirty := c.snapshotDirty
+	dirty := c.snapshotDirtyLocked()
 	c.mu.Unlock()
 	if dirty {
 		c.persistSnapshot()
@@ -139,35 +156,68 @@ func (c *Cache) persistSnapshotIfDirty() {
 // persistSnapshot serializes a consistent view and atomically replaces the
 // sidecar. snapshotMu orders captures as well as writes: without it, two
 // concurrent resolves could write an older captured map after a newer one.
-// Persistence failures disable future attempts for this cache instance; the
-// in-memory resolver remains fully functional.
+//
+// A failure (marshal or disk) only marks the CURRENT attempt degraded: it is
+// counted and surfaced but never disables later attempts. The in-memory
+// resolver stays fully functional, the cache stays dirty, and the next report
+// tick, Purge, or Close retries. That is the difference between best-effort
+// persistence and persistence that silently stops forever after one blip.
 func (c *Cache) persistSnapshot() {
 	if c.snapshotPath == "" {
 		return
 	}
 	c.snapshotMu.Lock()
 	defer c.snapshotMu.Unlock()
-	if c.snapshotOff {
-		return
-	}
 
 	c.mu.Lock()
 	data, err := c.marshalSnapshotLocked()
 	generation := c.snapshotGeneration
 	c.mu.Unlock()
 	if err != nil {
-		c.snapshotOff = true
+		c.noteSnapshotFailure(err)
 		return
 	}
 	if err := writeSnapshotAtomic(c.snapshotPath, data); err != nil {
-		c.snapshotOff = true
+		c.noteSnapshotFailure(err)
 		return
 	}
+	c.noteSnapshotSuccess(generation)
+}
+
+// noteSnapshotFailure records one failed persist attempt WITHOUT advancing the
+// persisted generation: the captured state stays owed, so the dirty check
+// retries it. Called with snapshotMu held.
+func (c *Cache) noteSnapshotFailure(cause error) {
 	c.mu.Lock()
-	if c.snapshotGeneration == generation {
-		c.snapshotDirty = false
-	}
+	c.snapshotFailures++
+	c.stats.snapshotPersistErrors++
+	c.snapshotLastError = cause.Error()
+	failures := c.snapshotFailures
 	c.mu.Unlock()
+	slog.Default().Warn("rdns snapshot persist failed; the in-memory cache stays warm and "+
+		"persistence retries on the next report tick, purge, or close",
+		"path", c.snapshotPath, "error", cause, "consecutive_failures", failures)
+}
+
+// noteSnapshotSuccess marks exactly the generation the completed write
+// captured as durable. Mutations that arrived while the write was in flight
+// already bumped snapshotGeneration past it, so they remain pending and get
+// their own write rather than being covered by a stale capture. Called with
+// snapshotMu held, which guarantees captures and writes are totally ordered.
+func (c *Cache) noteSnapshotSuccess(generation uint64) {
+	c.mu.Lock()
+	recovered := c.snapshotFailures > 0
+	if generation > c.snapshotPersistedGen {
+		c.snapshotPersistedGen = generation
+	}
+	c.snapshotFailures = 0
+	c.snapshotLastError = ""
+	c.snapshotLastSuccess = c.now()
+	c.mu.Unlock()
+	if recovered {
+		slog.Default().Info("rdns snapshot persistence recovered after consecutive failures",
+			"path", c.snapshotPath)
+	}
 }
 
 func (c *Cache) marshalSnapshotLocked() ([]byte, error) {

@@ -671,6 +671,13 @@ func (a *App) rdnsInfo() statusdata.RDNSInfo {
 	if !s.LastPurge.IsZero() {
 		info.LastPurge = s.LastPurge.UTC().Format(rfc3339)
 	}
+	info.SnapshotEnabled = s.SnapshotEnabled
+	info.SnapshotFailures = s.SnapshotFailures
+	info.SnapshotPendingGenerations = s.SnapshotPendingGenerations
+	info.SnapshotLastError = s.SnapshotLastError
+	if !s.SnapshotLastSuccess.IsZero() {
+		info.SnapshotLastSuccess = s.SnapshotLastSuccess.UTC().Format(rfc3339)
+	}
 	return info
 }
 

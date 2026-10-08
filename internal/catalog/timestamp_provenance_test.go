@@ -19,6 +19,7 @@ func TestAbsoluteTimestampMetricsDeclareProvenance(t *testing.T) {
 		"tailscale.key.expiry":                                metricdoc.TimestampSource,
 		"tailscale.logstream.last_activity":                   metricdoc.TimestampSource,
 		"tailscale.posture_integration.last_sync":             metricdoc.TimestampSource,
+		"tailscale.rdns.snapshot.last_success":                 metricdoc.TimestampProcessLocal,
 		"tailscale.user.last_seen":                            metricdoc.TimestampSource,
 		"tailscale2otel.api.last_probe":                       metricdoc.TimestampProcessLocal,
 		"tailscale2otel.flow_store.last_checkpoint_timestamp": metricdoc.TimestampProcessLocal,

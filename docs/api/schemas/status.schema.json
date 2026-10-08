@@ -1244,6 +1244,21 @@
         "size": {
           "type": "integer"
         },
+        "snapshot_enabled": {
+          "type": "boolean"
+        },
+        "snapshot_failures": {
+          "type": "integer"
+        },
+        "snapshot_last_error": {
+          "type": "string"
+        },
+        "snapshot_last_success": {
+          "type": "string"
+        },
+        "snapshot_pending_generations": {
+          "type": "integer"
+        },
         "ttl": {
           "type": "string"
         }

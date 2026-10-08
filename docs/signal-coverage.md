@@ -48,7 +48,7 @@ A signal can carry more than one disposition, so the columns do not sum to the t
 
 | surface | signals | visualized | alertable | recorded | drives a variable |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| operational | 260 | 259 | 58 | 11 | 45 |
+| operational | 264 | 263 | 58 | 11 | 45 |
 | self_obs | 102 | 102 | 39 | 9 | 10 |
 
 ## Operational signals
@@ -256,6 +256,10 @@ A signal can carry more than one disposition, so the columns do not sum to the t
 | `tailscale.rdns.cache.overflows` | metric | `tailscale_rdns_cache_overflows_total` | visualized, alertable |  |
 | `tailscale.rdns.queries` | metric | `tailscale_rdns_queries_total` | visualized |  |
 | `tailscale.rdns.refreshes` | metric | `tailscale_rdns_refreshes_total` | visualized |  |
+| `tailscale.rdns.snapshot.consecutive_failures` | metric | `tailscale_rdns_snapshot_consecutive_failures_ratio` | visualized |  |
+| `tailscale.rdns.snapshot.last_success` | metric | `tailscale_rdns_snapshot_last_success_seconds` | visualized |  |
+| `tailscale.rdns.snapshot.pending_generations` | metric | `tailscale_rdns_snapshot_pending_generations_ratio` | visualized |  |
+| `tailscale.rdns.snapshot.persist_failures` | metric | `tailscale_rdns_snapshot_persist_failures_total` | visualized |  |
 | `tailscale.service.host.info` | metric | `tailscale_service_host_info_ratio` | visualized |  |
 | `tailscale.service.hosts` | metric | `tailscale_service_hosts_ratio` | visualized, alertable |  |
 | `tailscale.service.ports` | metric | `tailscale_service_ports` | visualized, drives_a_variable |  |

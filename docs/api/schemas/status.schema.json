@@ -812,6 +812,15 @@
             "last_checkpoint_at": {
               "type": "string"
             },
+            "loss_reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "lost_rows": {
+              "type": "integer"
+            },
             "persistent": {
               "type": "boolean"
             },
@@ -824,7 +833,13 @@
             "rows": {
               "type": "integer"
             },
+            "shutdown_drops": {
+              "type": "integer"
+            },
             "size_bytes": {
+              "type": "integer"
+            },
+            "written_rows": {
               "type": "integer"
             }
           },

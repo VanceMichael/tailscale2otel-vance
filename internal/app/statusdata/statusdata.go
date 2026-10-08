@@ -489,6 +489,17 @@ type FlowStoreBackend struct {
 	// full. Non-zero means the view is missing traffic that OTLP still carries,
 	// which is a different failure from Truncated above.
 	QueueDrops int64 `json:"queue_drops,omitempty"`
+	// WrittenRows counts observations that reached a durable Commit, each
+	// exactly once, summed across tailnet stores.
+	WrittenRows int64 `json:"written_rows,omitempty"`
+	// LostRows counts admitted observations that never committed because the
+	// write retry/shutdown budget was exhausted or the error was
+	// unrecoverable. LossReasons carries the distinct most-recent causes.
+	LostRows int64 `json:"lost_rows,omitempty"`
+	// ShutdownDrops counts observations that reached Record after Close began.
+	ShutdownDrops int64 `json:"shutdown_drops,omitempty"`
+	// LossReasons carries distinct write-loss causes, when LostRows is non-zero.
+	LossReasons []string `json:"loss_reasons,omitempty"`
 	// Rows retained and SizeBytes on disk, summed across every tailnet's file.
 	Rows      int64 `json:"rows,omitempty"`
 	SizeBytes int64 `json:"size_bytes,omitempty"`

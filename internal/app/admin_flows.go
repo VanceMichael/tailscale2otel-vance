@@ -255,6 +255,12 @@ func (a *App) flowStoreInfo() statusdata.FlowStoreInfo {
 		info.Backend.Persistent = b.Kind == flowstore.BackendSQLite
 		info.Backend.Queued += b.Queued
 		info.Backend.QueueDrops += b.QueueDrops
+		info.Backend.WrittenRows += b.WrittenRows
+		info.Backend.LostRows += b.LostRows
+		info.Backend.ShutdownDrops += b.ShutdownDrops
+		if b.LostReason != "" && !slices.Contains(info.Backend.LossReasons, b.LostReason) {
+			info.Backend.LossReasons = append(info.Backend.LossReasons, b.LostReason)
+		}
 		info.Backend.Rows += b.Rows
 		info.Backend.SizeBytes += b.SizeBytes
 		info.Backend.JournalSizeBytes += b.JournalSizeBytes
@@ -547,12 +553,21 @@ func (a *App) flowStoreFailures() []statusdata.FlowStoreFailure {
 // and taking every pod out of rotation over it would turn a partial fault into
 // an outage. See componentFailureReasons for the state that DOES gate /readyz.
 func flowStoreHealthReasons(info statusdata.FlowStoreInfo) []string {
-	if len(info.Failures) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(info.Failures))
+	var out []string
 	for _, f := range info.Failures {
 		out = append(out, fmt.Sprintf("flow store %q: configured but not open, so flow history is unavailable: %s", f.Tailnet, f.Error))
+	}
+	// Write-side failures must surface as health results with their actual
+	// counts and causes, distinct from a full queue.
+	if info.Backend.Persistent {
+		for _, reason := range info.Backend.LossReasons {
+			out = append(out, fmt.Sprintf(
+				"flow store: %d admitted observation(s) never committed: %s", info.Backend.LostRows, reason))
+		}
+		if info.Backend.ShutdownDrops > 0 {
+			out = append(out, fmt.Sprintf(
+				"flow store: %d observation(s) arrived after close began and were not written", info.Backend.ShutdownDrops))
+		}
 	}
 	return out
 }

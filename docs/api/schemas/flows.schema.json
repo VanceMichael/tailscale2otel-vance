@@ -920,8 +920,67 @@
               "format": "date-time",
               "type": "string"
             },
+            "last_success_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "lost_reason": {
+              "type": "string"
+            },
+            "lost_rows": {
+              "type": "integer"
+            },
             "path": {
               "type": "string"
+            },
+            "previous_run": {
+              "properties": {
+                "closed_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "counters": {
+                  "properties": {
+                    "admitted": {
+                      "type": "integer"
+                    },
+                    "committed": {
+                      "type": "integer"
+                    },
+                    "lost_rows": {
+                      "type": "integer"
+                    },
+                    "queue_drops": {
+                      "type": "integer"
+                    },
+                    "shutdown_drops": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                },
+                "last_lost_reason": {
+                  "type": "string"
+                },
+                "last_success_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "opened_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "unresolved": {
+                  "type": "integer"
+                }
+              },
+              "type": [
+                "object",
+                "null"
+              ]
             },
             "queue_drops": {
               "type": "integer"
@@ -932,7 +991,16 @@
             "rows": {
               "type": "integer"
             },
+            "shutdown_drops": {
+              "type": "integer"
+            },
             "size_bytes": {
+              "type": "integer"
+            },
+            "write_retries": {
+              "type": "integer"
+            },
+            "written_rows": {
               "type": "integer"
             }
           },

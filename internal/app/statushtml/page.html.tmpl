@@ -657,10 +657,11 @@ a.cta:hover{background:var(--t2o-hover);filter:none}
       {{end}}
       <div class="card"><div class="k">Coverage</div><div class="v" style="font-size:16px" id="flowCovered">{{if .Flows.Covered}}{{.Flows.Covered}}{{else}}nothing yet{{end}}</div><div class="sub">retention {{.Flows.Retention}}</div></div>
       <div class="card"><div class="k">Observations</div><div class="v" id="flowObservations">{{.Flows.Observations}}</div><div class="sub">connections recorded since start</div></div>
-      <div class="card{{if .Flows.Truncated}} warn2{{end}}"><div class="k">Truncated</div><div class="v" id="flowTruncated">{{.Flows.Truncated}}</div><div class="sub">{{if .Flows.Backend.Persistent}}{{if .Flows.Truncated}}observations rejected as outside the retention window{{else}}aggregates are exact — this backend does not fold keys{{end}}{{else}}{{if .Flows.Truncated}}folded into __other__ — ranked lists are partial{{else}}every key fits within the per-minute caps{{end}}{{end}}</div></div>
+      <div class="card{{if .Flows.Truncated}} warn2{{end}}"><div class="k">Truncated</div><div class="v" style="font-size:16px" id="flowTruncated">{{.Flows.Truncated}}</div><div class="sub">{{if .Flows.Backend.Persistent}}{{if .Flows.Truncated}}full-queue drops, post-close drops and failed writes — broken out below{{else}}aggregates are exact — every admitted observation is accounted{{end}}{{else}}{{if .Flows.Truncated}}folded into __other__ — ranked lists are partial{{else}}every key fits within the per-minute caps{{end}}{{end}}</div></div>
       {{if .Flows.Backend.Persistent}}
       <div class="card{{if not .Flows.Backend.Healthy}} warn2{{end}}"><div class="k">Backend</div><div class="v" style="font-size:16px" id="flowBackend">{{.Flows.Backend.Kind}}</div><div class="sub">{{if .Flows.Backend.Healthy}}on-disk store, survives restarts — flows.store.directory{{else}}UNHEALTHY: {{range .Flows.Backend.Errors}}{{.}} {{end}}{{end}}</div></div>
       <div class="card{{if .Flows.Backend.QueueDrops}} warn2{{end}}"><div class="k">Queue drops</div><div class="v" id="flowQueueDrops">{{.Flows.Backend.QueueDrops}}</div><div class="sub">{{if .Flows.Backend.QueueDrops}}the write-behind queue filled and these connections never reached disk — OTLP still carried them{{else}}no observation has been lost to a full write queue ({{.Flows.Backend.Queued}} waiting now){{end}}</div></div>
+      <div class="card{{if or .Flows.Backend.LostRows .Flows.Backend.ShutdownDrops}} warn2{{end}}"><div class="k">Write losses</div><div class="v" style="font-size:16px" id="flowLost">{{.Flows.Backend.LostRows}}</div><div class="sub">{{if .Flows.Backend.LostRows}}admitted observations never committed after bounded retries{{range .Flows.Backend.LossReasons}} — {{.}}{{end}}{{else}}every committed batch is counted exactly once{{end}}{{if .Flows.Backend.ShutdownDrops}}; {{.Flows.Backend.ShutdownDrops}} dropped after close began{{end}}</div></div>
       <div class="card"><div class="k">On disk</div><div class="v" style="font-size:16px" id="flowSize">{{.Flows.Backend.SizeBytes}} B</div><div class="sub">summed across every tailnet's database file, including indexes</div></div>
       <div class="card"><div class="k">Journal</div><div class="v" style="font-size:16px" id="flowJournal">{{.Flows.Backend.JournalSizeBytes}} B</div><div class="sub">WAL sidecar; last checkpoint <span id="flowCheckpoint">{{if .Flows.Backend.LastCheckpointAt}}{{.Flows.Backend.LastCheckpointAt}}{{else}}never{{end}}</span></div></div>
       {{else}}
@@ -1261,6 +1262,7 @@ function updateFlowStore(info){
     if(info.backend.persistent){
       setText('flowRows', info.backend.rows || 0);
       setText('flowQueueDrops', info.backend.queue_drops || 0);
+      setText('flowLost', info.backend.lost_rows || 0);
       setText('flowSize', (info.backend.size_bytes || 0)+' B');
       setText('flowJournal', (info.backend.journal_size_bytes || 0)+' B');
       setText('flowCheckpoint', info.backend.last_checkpoint_at ? relText(info.backend.last_checkpoint_at) : 'never');

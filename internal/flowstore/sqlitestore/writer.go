@@ -3,6 +3,7 @@ package sqlitestore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -31,37 +32,61 @@ func (s *Store) RecordResult(o flowstore.Observation) flowstore.Admission {
 	}
 	o = flowstore.NormalizeObservationForRetention(o)
 
-	// Once Close has been called, the drain goroutine may already have made
-	// its final pass, so an item sent after that would sit in the queue
-	// forever rather than reaching disk. Treat it as a drop rather than a
-	// silent leak.
-	select {
-	case <-s.done:
+	// Shutdown gate. The closed check and the producer registration are one
+	// atomic step with Close, so every observation is either admitted BEFORE
+	// the linearization boundary — its producer is counted in inflight and
+	// Close waits before the final drain — or is counted, once, as a shutdown
+	// drop. Nothing can be sent into the channel after the writer's final
+	// drain.
+	s.gateMu.Lock()
+	if s.closed {
+		s.gateMu.Unlock()
 		s.mu.Lock()
-		s.drops++
+		s.shutdownDrops++
 		s.mu.Unlock()
 		return adm
-	default:
 	}
+	s.inflight.Add(1)
+	s.gateMu.Unlock()
+	defer s.inflight.Done()
 
 	select {
 	case s.queue <- o:
 		s.mu.Lock()
-		s.recorded++
+		s.admitted++
 		s.mu.Unlock()
 	default:
 		s.mu.Lock()
-		s.drops++
+		s.queueDrops++
 		s.mu.Unlock()
 	}
 	return adm
 }
 
+// insertSQL is built once from the package's column constants. As in the old
+// flush, every observation value is bound as a parameter; only this package's
+// own column list and matching "?" placeholders are interpolated.
+//
+//nolint:gosec // G201: column list is a package constant, values are bound parameters
+var insertSQL = fmt.Sprintf(
+	"INSERT INTO flows (%s) VALUES (%s)",
+	strings.Join(columns, ", "), strings.Join(questionMarks(len(columns)), ", "),
+)
+
+func questionMarks(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = "?"
+	}
+	return out
+}
+
 // run is the single write-behind goroutine: it drains s.queue in batches,
-// flushing on a full batch, a periodic tick, or shutdown, and runs the
-// retention sweep on its own slower tick. There is exactly one of these per
-// Store, which is what lets flush use one unsynchronized *sql.Tx per batch
-// without a second layer of locking.
+// flushing on a full batch or a periodic tick, and runs the retention sweep on
+// its own slower tick. A failed flush no longer discards its batch: writeBatch
+// keeps the same observations, retries them with its bounded policy and only
+// records a declared loss when a budget is exhausted or the error is
+// unrecoverable.
 func (s *Store) run() {
 	defer s.wg.Done()
 
@@ -82,43 +107,92 @@ func (s *Store) run() {
 		defer vacuumTicker.Stop()
 	}
 
-	batch := make([]flowstore.Observation, 0, s.opts.BatchSize)
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		_ = s.flush(batch) // errors are recorded via s.fail; nothing more to do here
-		batch = batch[:0]
-	}
+	pending := make([]flowstore.Observation, 0, s.opts.BatchSize)
 
 	for {
 		select {
 		case o := <-s.queue:
-			batch = append(batch, o)
-			if len(batch) >= s.opts.BatchSize {
-				flush()
+			pending = append(pending, o)
+			if len(pending) >= s.opts.BatchSize {
+				if retained := s.writeBatch(pending, false); retained {
+					s.shutdownDrain(pending)
+					return
+				}
+				pending = pending[:0]
 			}
 		case <-flushTicker.C:
-			flush()
+			if retained := s.writeBatch(pending, false); retained {
+				s.shutdownDrain(pending)
+				return
+			}
+			pending = pending[:0]
 		case <-sweepTicker.C:
+			// Once shutdown has begun, spend the remaining budget on draining
+			// accepted observations, not on maintenance.
+			if s.closingBegun() {
+				s.shutdownDrain(pending)
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), s.opts.QueryTimeout)
 			s.maintain(ctx, true, s.opts.IncrementalVacuumInterval <= 0)
 			cancel()
 		case <-vacuumC:
+			if s.closingBegun() {
+				s.shutdownDrain(pending)
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), s.opts.QueryTimeout)
 			s.maintain(ctx, false, true)
 			cancel()
-		case <-s.done:
-			// Clean shutdown: whatever is already sitting in the queue was
-			// accepted as far as the emit path is concerned, so drain it
-			// (non-blocking — nothing is sending anymore once RecordResult
-			// observes s.done closed) and flush before exiting.
+		case <-s.closing:
+			s.shutdownDrain(pending)
+			return
+		}
+	}
+}
+
+// closingBegun reports the shutdown boundary without blocking.
+func (s *Store) closingBegun() bool {
+	select {
+	case <-s.closing:
+		return true
+	default:
+		return false
+	}
+}
+
+// shutdownDrain runs the ordered shutdown sequence:
+//
+//  1. Consume queued observations until Close signals finalDrain, which it
+//     closes only after every producer that passed the gate has settled.
+//  2. Drain whatever is already queued at that point — exhaustive, because no
+//     producer can still be sending.
+//  3. Make the final bounded write attempts against the shutdown deadline; a
+//     batch still unwritten then is declared lost with a shutdown-budget
+//     reason.
+//  4. Persist the run_state=closed manifest so the next Open reconciles.
+func (s *Store) shutdownDrain(pending []flowstore.Observation) {
+	for {
+		select {
+		case o := <-s.queue:
+			pending = append(pending, o)
+		case <-s.finalDrain:
 			for {
 				select {
 				case o := <-s.queue:
-					batch = append(batch, o)
+					pending = append(pending, o)
 				default:
-					flush()
+					if len(pending) > 0 {
+						// writeBatch either commits the batch once or declares
+						// its loss; it never returns retained here because the
+						// retry waits are timer-only in shutdown mode.
+						s.writeBatch(pending, true)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), s.opts.QueryTimeout)
+					if err := s.persistSnapshot(ctx, runStateClosed); err != nil {
+						s.fail(err)
+					}
+					cancel()
 					return
 				}
 			}
@@ -126,13 +200,148 @@ func (s *Store) run() {
 	}
 }
 
-// flush writes one batch in a single transaction. The column list and
-// placeholders are built from the shared columns slice in schema.go so the
-// statement can never drift from the schema; the bind values below are in
-// that same fixed order.
-func (s *Store) flush(batch []flowstore.Observation) error {
+// writeBatch drives one batch through the write-failure lifecycle.
+//
+// It returns true only when shutdown interrupted the retry backoff while
+// running: the batch is RETAINED — untouched and uncounted — and the caller
+// must hand it to shutdownDrain. Every other path accounts the batch exactly
+// once: a successful commit increments committed by len(batch), or a declared
+// loss increments writeLost by len(batch) with the cause.
+//
+// Retries are bounded two ways: while running, at most MaxWriteRetries
+// additional attempts and no longer than MaxRetryElapsed; in shutdown, the
+// ShutdownTimeout deadline is the bound. Backoff is deterministic exponential,
+// capped, and is interrupted by the closing boundary except in shutdown mode.
+func (s *Store) writeBatch(batch []flowstore.Observation, shutdown bool) bool {
 	if len(batch) == 0 {
-		return nil
+		return false
+	}
+	deadline := s.writeDeadline(shutdown)
+
+	for {
+		err := s.flushOnce(batch)
+		if err == nil {
+			s.afterCommit()
+			return false
+		}
+
+		if !classifyWriteError(err) {
+			s.declareLossWithCtx(shutdown, deadline, batch,
+				fmt.Errorf("unrecoverable write error after %d attempt(s): %w", s.writeAttempt, err))
+			return false
+		}
+
+		// The failure may clear on the next attempt. Decide whether another
+		// attempt fits the bounded policy BEFORE counting it.
+		now := s.opts.Now()
+		d := s.retryBackoff(s.writeAttempt)
+		if s.retriesExhausted(shutdown, now, deadline) || !now.Add(d).Before(deadline) {
+			s.declareLossWithCtx(shutdown, deadline, batch,
+				fmt.Errorf("%s after %d attempt(s): %w", giveUpReason(shutdown), s.writeAttempt, err))
+			return false
+		}
+
+		s.mu.Lock()
+		s.retries++
+		s.mu.Unlock()
+
+		if shutdown {
+			sleepFor(d)
+		} else if interrupted := s.waitRetry(d); interrupted {
+			// closing became visible mid-backoff: stop normal retries. The
+			// batch is retained and shutdownDrain retries it under the
+			// shutdown budget.
+			return true
+		}
+	}
+}
+
+func (s *Store) writeDeadline(shutdown bool) time.Time {
+	if shutdown {
+		return s.opts.Now().Add(s.opts.ShutdownTimeout)
+	}
+	return s.opts.Now().Add(s.opts.MaxRetryElapsed)
+}
+
+// retriesExhausted combines the attempt cap (running only; shutdown uses the
+// deadline as its real bound, with a high safety cap) with the elapsed
+// deadline.
+func (s *Store) retriesExhausted(shutdown bool, now, deadline time.Time) bool {
+	if !now.Before(deadline) {
+		return true
+	}
+	if shutdown {
+		return s.writeAttempt >= 1000
+	}
+	return s.writeAttempt > s.opts.MaxWriteRetries
+}
+
+// retryBackoff returns the wait after a failed attempt: Min*2^(attempt-1),
+// capped at Max. Deterministic, no randomness, so behavior is reproducible.
+func (s *Store) retryBackoff(attempt int) time.Duration {
+	d := s.opts.RetryMinBackoff
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d >= s.opts.RetryMaxBackoff {
+			return s.opts.RetryMaxBackoff
+		}
+	}
+	if d > s.opts.RetryMaxBackoff {
+		return s.opts.RetryMaxBackoff
+	}
+	return d
+}
+
+func giveUpReason(shutdown bool) string {
+	if shutdown {
+		return "shutdown write budget exhausted"
+	}
+	return "write retry budget exhausted"
+}
+
+// lossContext bounds the metadata write that records a declared loss.
+func (s *Store) lossContext(shutdown bool, deadline time.Time) (context.Context, context.CancelFunc) {
+	if shutdown {
+		if remaining := deadline.Sub(s.opts.Now()); remaining > 0 {
+			return context.WithTimeout(context.Background(), remaining)
+		}
+	}
+	return s.queryCtx()
+}
+
+// waitRetry sleeps with one eye on the shutdown boundary, reporting whether
+// closing interrupted the wait.
+func (s *Store) waitRetry(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-s.closing:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// sleepFor is an uninterruptible timer wait, used in shutdown where the
+// closing channel is already closed and therefore unselectable.
+func sleepFor(d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	<-timer.C
+}
+
+// flushOnce makes exactly one transactional write attempt. It does NOT record
+// the failure: classification and loss declaration belong to writeBatch, so a
+// transient failure leaves the batch untouched and retryable.
+//
+// The writer manifest is upserted inside the same transaction, after the row
+// inserts, so persisted rows and counters always commit atomically.
+func (s *Store) flushOnce(batch []flowstore.Observation) error {
+	s.writeAttempt++
+	if s.writeFault != nil {
+		if err := s.writeFault(s.writeAttempt); err != nil {
+			return err
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.QueryTimeout)
@@ -140,27 +349,12 @@ func (s *Store) flush(batch []flowstore.Observation) error {
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		s.fail(err)
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after a successful Commit
 
-	placeholders := make([]string, len(columns))
-	for i := range columns {
-		placeholders[i] = "?"
-	}
-	// The only interpolated values are this package's own `columns` slice and a
-	// matching run of "?" placeholders — both compile-time constants of the
-	// schema, neither reachable from a request. Every observation value is bound
-	// as a parameter below, never formatted into the statement.
-	insert := fmt.Sprintf( //nolint:gosec // G201: column list is a package constant, values are bound parameters
-		"INSERT INTO flows (%s) VALUES (%s)",
-		strings.Join(columns, ", "), strings.Join(placeholders, ", "),
-	)
-
-	stmt, err := tx.PrepareContext(ctx, insert)
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		s.fail(err)
 		return err
 	}
 	defer func() { _ = stmt.Close() }()
@@ -197,22 +391,142 @@ func (s *Store) flush(batch []flowstore.Observation) error {
 			o.Counts.RxPkts,
 			o.Counts.Flows,
 		); err != nil {
-			s.fail(err)
 			return err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		s.fail(err)
+	// Advance the in-memory counters BEFORE Commit: once the committed rows
+	// become visible to readers, the counters must already account for them.
+	// The previous values are saved so any failure after this point restores
+	// them; the transaction itself — rows and manifest row — rolls back
+	// atomically.
+	now := s.opts.Now().UTC()
+	s.mu.Lock()
+	prevCommitted := s.committed
+	prevSuccess := s.lastSuccessAt
+	prevWriteFailure := s.writeFailure
+	s.committed += int64(len(batch))
+	s.writeFailure = nil
+	s.lastSuccessAt = now
+
+	// The manifest row in the SAME transaction reflects the same post-commit
+	// totals, so rows and counters are consistent when the next process opens
+	// the file.
+	m := s.buildManifestLocked(runStateOpen)
+	s.mu.Unlock()
+
+	raw, err := json.Marshal(m)
+	if err != nil {
+		s.restoreCommitCounters(prevCommitted, prevSuccess, prevWriteFailure)
+		return fmt.Errorf("encode writer manifest: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, upsertManifestSQL, manifestKey, string(raw)); err != nil {
+		s.restoreCommitCounters(prevCommitted, prevSuccess, prevWriteFailure)
 		return err
 	}
-	// Checkpoint after a committed batch so the WAL sidecar does not grow
-	// without bound during a quiet period, and so Stats can report a real
-	// last-successful-checkpoint time even when the sweep cadence is long.
-	checkpointCtx, checkpointCancel := s.queryCtx()
-	_ = s.checkpoint(checkpointCtx)
-	checkpointCancel()
+
+	if err := tx.Commit(); err != nil {
+		s.restoreCommitCounters(prevCommitted, prevSuccess, prevWriteFailure)
+		return err
+	}
+
+	s.mu.Lock()
+	s.writeAttempt = 0
+	s.mu.Unlock()
 	return nil
+}
+
+// restoreCommitCounters undoes the pre-commit counter advance after a failed
+// or abandoned commit attempt.
+func (s *Store) restoreCommitCounters(committed int64, successAt time.Time, writeFailure error) {
+	s.mu.Lock()
+	s.committed = committed
+	s.lastSuccessAt = successAt
+	s.writeFailure = writeFailure
+	s.mu.Unlock()
+}
+
+// afterCommit runs the post-commit maintenance: the passive checkpoint that
+// keeps the WAL bounded (as before) and a manifest write carrying the
+// checkpoint time. Counters themselves were advanced before Commit.
+func (s *Store) afterCommit() {
+	checkpointCtx, checkpointCancel := s.queryCtx()
+	defer checkpointCancel()
+	if err := s.checkpoint(checkpointCtx); err != nil {
+		return
+	}
+	if err := s.persistSnapshot(checkpointCtx, runStateOpen); err != nil {
+		s.fail(err)
+	}
+}
+
+// declareLoss records observations that are genuinely not going to be written:
+// writeLost advances by exactly the batch size, the cause is carried as the
+// current write failure and persisted best-effort. It is never folded into
+// QueueDrops.
+func (s *Store) declareLoss(ctx context.Context, batch []flowstore.Observation, cause error) {
+	now := s.opts.Now().UTC()
+	s.mu.Lock()
+	s.writeLost += int64(len(batch))
+	s.writeFailure = cause
+	s.lastLostAt = now
+	s.lastLostReason = cause.Error()
+	s.writeAttempt = 0
+	s.mu.Unlock()
+
+	if err := s.persistSnapshot(ctx, runStateOpen); err != nil {
+		s.fail(err)
+	}
+}
+
+// declareLossWithCtx pairs loss declaration with a bounded metadata context,
+// derived from the shutdown deadline or the query timeout while running.
+func (s *Store) declareLossWithCtx(shutdown bool, deadline time.Time, batch []flowstore.Observation, cause error) {
+	ctx, cancel := s.lossContext(shutdown, deadline)
+	defer cancel()
+	s.declareLoss(ctx, batch, cause)
+}
+
+// persistSnapshot writes the current counters and lifecycle state to disk.
+func (s *Store) persistSnapshot(ctx context.Context, runState string) error {
+	s.mu.Lock()
+	m := s.buildManifestLocked(runState)
+	s.mu.Unlock()
+	return persistManifest(ctx, s.db, m)
+}
+
+// buildManifestLocked assembles the manifest from the counters under mu. For a
+// closed manifest it stamps ClosedAt from the configured clock.
+func (s *Store) buildManifestLocked(runState string) *writerManifest {
+	pointerTime := func(t time.Time) *time.Time {
+		if t.IsZero() {
+			return nil
+		}
+		utc := t.UTC()
+		return &utc
+	}
+	m := &writerManifest{
+		Schema:   manifestSchema,
+		RunState: runState,
+		OpenedAt: pointerTime(s.openedAt),
+		Counters: storedCounters{
+			Admitted:      s.admitted,
+			Committed:     s.committed,
+			WriteLost:     s.writeLost,
+			QueueDrops:    s.queueDrops,
+			ShutdownDrops: s.shutdownDrops,
+			Retries:       s.retries,
+		},
+		LastSuccessAt:    pointerTime(s.lastSuccessAt),
+		LastLostAt:       pointerTime(s.lastLostAt),
+		LastLostReason:   s.lastLostReason,
+		LastCheckpointAt: pointerTime(s.lastCheckpointAt),
+	}
+	if runState == runStateClosed {
+		closed := s.opts.Now().UTC()
+		m.ClosedAt = &closed
+	}
+	return m
 }
 
 // maintain runs one bounded writer-maintenance pass. The sweep is optional
@@ -224,7 +538,11 @@ func (s *Store) maintain(ctx context.Context, sweep, reclaim bool) {
 	if sweep {
 		_ = s.sweep(ctx)
 	}
-	_ = s.checkpoint(ctx)
+	if err := s.checkpoint(ctx); err == nil {
+		if err := s.persistSnapshot(ctx, runStateOpen); err != nil {
+			s.fail(err)
+		}
+	}
 	if reclaim {
 		_ = s.incrementalVacuum(ctx)
 	}
@@ -244,7 +562,7 @@ func (s *Store) checkpoint(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
-	s.lastCheckpointAt = time.Now().UTC()
+	s.lastCheckpointAt = s.opts.Now().UTC()
 	s.mu.Unlock()
 	return nil
 }
@@ -303,43 +621,32 @@ func (s *Store) sweep(ctx context.Context) error {
 // Stats implements flowstore.Store. It must never panic: a read failure here
 // degrades to an unhealthy Backend rather than propagating an error, because
 // the admin status page must still render around a broken backend.
+//
+// Snapshot order matters and is deliberate: the on-disk row view is read
+// FIRST, and counters are read AFTER. flushOnce advances the committed
+// counter strictly before Commit makes rows visible, so a committed row count
+// can never be paired with a stale counter; the reverse — counters a hair
+// ahead of the row view — is bounded by one commit's duration and fails in
+// the honest direction for the "are all accepted rows on disk" question.
 func (s *Store) Stats() flowstore.Stats {
-	s.mu.Lock()
-	recorded, drops, failure := s.recorded, s.drops, s.failure
-	s.mu.Unlock()
-
-	backend := flowstore.Backend{
-		Kind:       flowstore.BackendSQLite,
-		Path:       s.path,
-		Healthy:    failure == nil,
-		Queued:     len(s.queue),
-		QueueDrops: drops,
-	}
-	if failure != nil {
-		backend.Error = failure.Error()
-	}
-
-	st := flowstore.Stats{
-		Observations: recorded,
-		Truncated:    drops,
-	}
+	var st flowstore.Stats
+	var backend flowstore.Backend
 
 	ctx, cancel := s.queryCtx()
-	defer cancel()
 
+	// readsOK tracks the on-disk read portion of the snapshot.
+	readsOK := true
 	var rows int64
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM flows").Scan(&rows); err != nil {
-		backend.Healthy = false
-		if backend.Error == "" {
-			backend.Error = err.Error()
-		}
+		readsOK = false
+		backend.Error = err.Error()
 	} else {
 		backend.Rows = rows
 	}
 
 	var minTime, maxTime sql.NullInt64
 	if err := s.db.QueryRowContext(ctx, "SELECT MIN(time), MAX(time) FROM flows").Scan(&minTime, &maxTime); err != nil {
-		backend.Healthy = false
+		readsOK = false
 		if backend.Error == "" {
 			backend.Error = err.Error()
 		}
@@ -351,6 +658,54 @@ func (s *Store) Stats() flowstore.Stats {
 			st.Latest = dbToTime(maxTime.Int64)
 		}
 	}
+	cancel()
+
+	// Counters after the row view.
+	s.mu.Lock()
+	admittedN := s.admitted
+	committedN := s.committed
+	writeLostN := s.writeLost
+	queueDropsN := s.queueDrops
+	shutdownDropsN := s.shutdownDrops
+	retriesN := s.retries
+	failure := s.failure
+	batchFailure := s.writeFailure
+	lastSuccess := s.lastSuccessAt
+	lostReason := s.lastLostReason
+	lastCheckpoint := s.lastCheckpointAt
+	previousRun := s.previousRun
+	s.mu.Unlock()
+
+	if failure != nil || batchFailure != nil || !readsOK {
+		backend.Healthy = false
+	} else {
+		backend.Healthy = true
+	}
+	switch {
+	case failure != nil:
+		// A sticky failure takes precedence in the displayed error.
+		backend.Error = failure.Error()
+	case batchFailure != nil:
+		backend.Error = batchFailure.Error()
+	}
+
+	backend.Kind = flowstore.BackendSQLite
+	backend.Path = s.path
+	backend.Queued = len(s.queue)
+	backend.QueueDrops = queueDropsN
+	backend.WrittenRows = committedN
+	backend.LostRows = writeLostN
+	backend.LostReason = lostReason
+	backend.ShutdownDrops = shutdownDropsN
+	backend.WriteRetries = retriesN
+	backend.LastSuccessAt = lastSuccess
+	backend.PreviousRun = previousRun
+	backend.LastCheckpointAt = lastCheckpoint
+
+	st.Observations = admittedN
+	// Every unrecovered loss, with its nature broken out on Backend rather
+	// than disguised as an ordinary queue drop.
+	st.Truncated = queueDropsN + shutdownDropsN + writeLostN
 
 	if fi, err := os.Stat(s.path); err == nil {
 		backend.SizeBytes = fi.Size()
@@ -358,10 +713,6 @@ func (s *Store) Stats() flowstore.Stats {
 	if fi, err := os.Stat(s.path + "-wal"); err == nil {
 		backend.JournalSizeBytes = fi.Size()
 	}
-
-	s.mu.Lock()
-	backend.LastCheckpointAt = s.lastCheckpointAt
-	s.mu.Unlock()
 
 	st.Backend = backend
 	return st

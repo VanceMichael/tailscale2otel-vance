@@ -69,6 +69,27 @@ const (
 	// by one maintenance tick. The interval itself has no fixed duration:
 	// zero means the existing sweep cadence.
 	DefaultIncrementalVacuumPages = 1000
+
+	// Write-failure lifecycle defaults. A failed Begin/Exec/Commit no longer
+	// discards its batch: the same observations are retried with these bounds,
+	// and only a budget exhaustion (or an unrecoverable error) is recorded as
+	// an explicit loss.
+	//
+	// DefaultMaxWriteRetries is the cap on ADDITIONAL attempts after the first
+	// failure, while running. DefaultMaxRetryElapsed bounds the total elapsed
+	// retry time independently, so a long query timeout cannot turn a few
+	// retries into an unbounded wait.
+	DefaultMaxWriteRetries = 5
+	DefaultMaxRetryElapsed = 30 * time.Second
+	// DefaultRetryMinBackoff/MaxBackoff bound the deterministic exponential
+	// backoff between attempts (doubling per attempt, capped).
+	DefaultRetryMinBackoff = 20 * time.Millisecond
+	DefaultRetryMaxBackoff = 500 * time.Millisecond
+	// DefaultShutdownTimeout bounds the final drain's write attempts during
+	// Close. It stays below the app layer's flowStoreCloseTimeout (10s) so
+	// that stage also covers process teardown; a batch still unwritten at the
+	// deadline is counted as a loss with a shutdown-budget reason.
+	DefaultShutdownTimeout = 8 * time.Second
 )
 
 // Options configures one per-tailnet database.
@@ -118,6 +139,16 @@ type Options struct {
 	IncrementalVacuumInterval time.Duration
 	// IncrementalVacuumPages bounds the number of pages reclaimed per tick.
 	IncrementalVacuumPages int
+	// MaxWriteRetries caps ADDITIONAL write attempts after a transient failure
+	// while running. MaxRetryElapsed bounds total elapsed retry time.
+	MaxWriteRetries int
+	MaxRetryElapsed  time.Duration
+	// RetryMinBackoff/RetryMaxBackoff bound exponential backoff between retries.
+	RetryMinBackoff time.Duration
+	RetryMaxBackoff time.Duration
+	// ShutdownTimeout bounds the final drain write attempts at Close. A batch
+	// still unwritten at the deadline is declared lost with its reason.
+	ShutdownTimeout time.Duration
 	// Now is the clock, injectable for tests.
 	Now func() time.Time
 	// Redact applies the configured PII policy to an observation BEFORE it is
@@ -159,6 +190,21 @@ func (o *Options) applyDefaults() {
 	if o.IncrementalVacuumPages <= 0 {
 		o.IncrementalVacuumPages = DefaultIncrementalVacuumPages
 	}
+	if o.MaxWriteRetries <= 0 {
+		o.MaxWriteRetries = DefaultMaxWriteRetries
+	}
+	if o.MaxRetryElapsed <= 0 {
+		o.MaxRetryElapsed = DefaultMaxRetryElapsed
+	}
+	if o.RetryMinBackoff <= 0 {
+		o.RetryMinBackoff = DefaultRetryMinBackoff
+	}
+	if o.RetryMaxBackoff <= 0 {
+		o.RetryMaxBackoff = DefaultRetryMaxBackoff
+	}
+	if o.ShutdownTimeout <= 0 {
+		o.ShutdownTimeout = DefaultShutdownTimeout
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -182,27 +228,74 @@ type Store struct {
 	path string
 
 	// queue carries observations from the emit path to the writer goroutine.
-	// Buffered and bounded: a send that would block is dropped instead.
+	// Buffered and bounded: a send that would block is dropped and counted.
 	queue chan flowstore.Observation
-	done  chan struct{}
-	wg    sync.WaitGroup
 
-	mu       sync.Mutex
-	recorded int64
-	drops    int64
-	failure  error
-	// lastCheckpointAt is guarded by mu with the counters above. It is kept in
-	// process memory rather than SQLite metadata: the timestamp describes this
-	// process's observed maintenance, not data carried across a restart.
+	// Shutdown linearization. gateMu guards closed and pairs with inflight: a
+	// producer that passes the gate registers in inflight BEFORE it enqueues,
+	// and Close waits inflight to zero (only after setting closed) before the
+	// writer makes its final drain pass.
+	gateMu   sync.Mutex
+	closed   bool
+	inflight sync.WaitGroup
+	// closing is the producer-visible shutdown boundary. finalDrain closes
+	// strictly after every gated producer has settled, which is what makes the
+	// writer's post-finalDrain queue drain exhaustive: nothing can still be
+	// sending into the channel.
+	closing    chan struct{}
+	finalDrain chan struct{}
+
+	wg sync.WaitGroup
+
+	// openedAt stamps this process's Open and is carried into every manifest,
+	// so the next run can bracket the previous one.
+	openedAt time.Time
+
+	mu sync.Mutex
+	// Cumulative counters, seeded from the persisted manifest at Open and
+	// carried back into it at every commit/loss/close.
+	admitted      int64 // enqueued through the gate
+	committed     int64 // durable Commits, each observation once
+	writeLost     int64 // admitted but never committed (budget/terminal)
+	queueDrops    int64 // queue full
+	shutdownDrops int64 // reached Record after the closing boundary
+	retries       int64 // additional attempts after a transient failure
+
+	// failure is a sticky backend failure (failed migration, deferred
+	// auto-vacuum conversion, interrupted previous run, maintenance I/O).
+	// writeFailure is the current batch failure and is CLEARED by the next
+	// successful commit, so recovery is visible while the cumulative loss
+	// counters remain.
+	failure      error
+	writeFailure error
+
+	lastSuccessAt time.Time
+	lastLostAt    time.Time
+	lastLostReason string
+
+	// lastCheckpointAt is guarded by mu with the counters above and carried by
+	// the manifest, so a restart can show the previous run's checkpoint.
 	lastCheckpointAt time.Time
+
+	// previousRun is the manifest summary loaded at Open; nil for a brand-new
+	// database.
+	previousRun *flowstore.PreviousRun
+
+	// writeFault, when non-nil, is consulted at the start of each write
+	// attempt and substitutes its error for a real database error. Test-only;
+	// nil in production.
+	writeFault func(attempt int) error
+
+	// writeAttempt counts attempts of the CURRENT batch across retries.
+	writeAttempt int
 }
 
 var _ flowstore.Store = (*Store)(nil)
 
-// fail records a backend failure. The view stays up and keeps serving what it
-// has — a read error must not take the admin page down — but Stats reports
-// unhealthy so the operator is told the data is no longer trustworthy rather
-// than silently reading a stale or partial window.
+// fail records a sticky backend failure. The view stays up and keeps serving
+// what it has — a read error must not take the admin page down — but Stats
+// reports unhealthy so the operator is told the data is no longer trustworthy
+// rather than silently reading a stale or partial window.
 func (s *Store) fail(err error) {
 	if err == nil {
 		return

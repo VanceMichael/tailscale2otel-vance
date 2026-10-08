@@ -136,9 +136,10 @@ func TestRecordResult_QueueFullDrops(t *testing.T) {
 	opts := testOpts(t)
 	opts.applyDefaults()
 	s := &Store{
-		opts:  opts,
-		queue: make(chan flowstore.Observation, 1),
-		done:  make(chan struct{}),
+		opts:       opts,
+		queue:      make(chan flowstore.Observation, 1),
+		closing:    make(chan struct{}),
+		finalDrain: make(chan struct{}),
 	}
 
 	now := opts.Now()
@@ -150,14 +151,14 @@ func TestRecordResult_QueueFullDrops(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	recorded, drops := s.recorded, s.drops
+	recorded, drops := s.admitted, s.queueDrops
 	s.mu.Unlock()
 
 	if recorded != 1 {
-		t.Fatalf("recorded = %d, want 1", recorded)
+		t.Fatalf("admitted = %d, want 1", recorded)
 	}
 	if drops != 1 {
-		t.Fatalf("drops = %d, want 1", drops)
+		t.Fatalf("queueDrops = %d, want 1", drops)
 	}
 	if len(s.queue) != 1 {
 		t.Fatalf("queue len = %d, want 1 (still full, second observation dropped not queued)", len(s.queue))
@@ -172,9 +173,10 @@ func TestRecordResult_AdmissionRejectsExpiredAndFuture(t *testing.T) {
 	opts.Now = func() time.Time { return now }
 	opts.applyDefaults()
 	s := &Store{
-		opts:  opts,
-		queue: make(chan flowstore.Observation, 8),
-		done:  make(chan struct{}),
+		opts:       opts,
+		queue:      make(chan flowstore.Observation, 8),
+		closing:    make(chan struct{}),
+		finalDrain: make(chan struct{}),
 	}
 
 	expired := obs(now.Add(-2 * opts.Retention))

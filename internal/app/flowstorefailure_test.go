@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rknightion/tailscale2otel/v5/internal/app/statusdata"
 	"github.com/rknightion/tailscale2otel/v5/internal/config"
 )
 
@@ -83,6 +84,53 @@ func TestFlowStoreHealthySurfaceReportsNothing(t *testing.T) {
 // admin flow view is off, and pulling every pod out of rotation for it would
 // turn a partial fault into an outage — the same asymmetry the delivery and
 // degraded-collector paths already keep.
+// Declared write losses must reach the health surface with their real count
+// and cause, distinct from queue drops; post-close drops are reported too.
+func TestFlowStoreWriteLossesReachHealthReasons(t *testing.T) {
+	info := statusdata.FlowStoreInfo{
+		Enabled: true,
+		Backend: statusdata.FlowStoreBackend{
+			Persistent:   true,
+			Healthy:      false,
+			LostRows:     7,
+			LossReasons:  []string{"shutdown write budget exhausted after 3 attempt(s): database is locked (5) (SQLITE_BUSY)"},
+			ShutdownDrops: 2,
+		},
+	}
+
+	reasons := flowStoreHealthReasons(info)
+	if len(reasons) != 2 {
+		t.Fatalf("health reasons = %v, want write-loss and shutdown-drop reasons", reasons)
+	}
+	joined := strings.Join(reasons, "\n")
+	if !strings.Contains(joined, "7 admitted observation(s) never committed") ||
+		!strings.Contains(joined, "SQLITE_BUSY") {
+		t.Errorf("write-loss reason missing count/cause: %v", reasons)
+	}
+	if !strings.Contains(joined, "2 observation(s) arrived after close began") {
+		t.Errorf("shutdown-drop reason missing: %v", reasons)
+	}
+
+	state, all := deriveHealth(nil, reasons)
+	if state != healthDegraded {
+		t.Errorf("health = %q, want %q", state, healthDegraded)
+	}
+	if len(all) != 2 {
+		t.Errorf("degraded verdict carried %d reasons, want 2", len(all))
+	}
+}
+
+// No losses, no noise: a healthy persistent backend contributes no reasons.
+func TestFlowStoreHealthyBackendContributesNoReasons(t *testing.T) {
+	info := statusdata.FlowStoreInfo{
+		Enabled: true,
+		Backend: statusdata.FlowStoreBackend{Persistent: true, Healthy: true},
+	}
+	if got := flowStoreHealthReasons(info); len(got) != 0 {
+		t.Errorf("health reasons = %v, want none", got)
+	}
+}
+
 func TestFlowStoreOpenFailureDoesNotGateReadiness(t *testing.T) {
 	cfg := config.Default()
 	cfg.Flows.Store.Directory = "/var/lib/tailscale2otel/flows"

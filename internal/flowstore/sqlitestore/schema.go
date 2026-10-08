@@ -253,12 +253,78 @@ func Open(opts Options) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
 
+	// Load the persisted writer lifecycle before constructing the store, so
+	// cumulative counters continue and the previous run (clean close, declared
+	// losses or interrupted run) can be explained on the status surface.
+	manifestCtx, manifestCancel := context.WithTimeout(context.Background(), opts.QueryTimeout)
+	manifest, err := loadManifest(manifestCtx, db)
+	manifestCancel()
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
+	var (
+		counters                        storedCounters
+		previousRun                     *flowstore.PreviousRun
+		lastSuccessAt, lastLostAt       time.Time
+		lastLostReason                  string
+		lastCheckpointAt                time.Time
+	)
+	if manifest != nil {
+		counters = manifest.Counters
+		lastSuccessAt = derefTime(manifest.LastSuccessAt)
+		lastLostAt = derefTime(manifest.LastLostAt)
+		lastLostReason = manifest.LastLostReason
+		lastCheckpointAt = derefTime(manifest.LastCheckpointAt)
+
+		previousRun = &flowstore.PreviousRun{
+			State:    flowstore.PreviousRunClean,
+			OpenedAt: derefTime(manifest.OpenedAt),
+			ClosedAt: derefTime(manifest.ClosedAt),
+			Counters: flowstore.PreviousRunCounters{
+				Admitted:      counters.Admitted,
+				Committed:     counters.Committed,
+				LostRows:      counters.WriteLost,
+				QueueDrops:    counters.QueueDrops,
+				ShutdownDrops: counters.ShutdownDrops,
+			},
+			LastSuccessAt:  lastSuccessAt,
+			LastLostReason: lastLostReason,
+		}
+		if manifest.RunState != runStateClosed {
+			previousRun.State = flowstore.PreviousRunInterrupted
+			previousRun.Unresolved = counters.Admitted - counters.Committed - counters.WriteLost
+			if previousRun.Unresolved < 0 {
+				previousRun.Unresolved = 0
+			}
+		}
+	}
+
 	s := &Store{
 		opts:  opts,
 		db:    db,
 		path:  path,
 		queue: make(chan flowstore.Observation, opts.QueueSize),
-		done:  make(chan struct{}),
+
+		closing:    make(chan struct{}),
+		finalDrain: make(chan struct{}),
+
+		openedAt: opts.Now().UTC(),
+
+		admitted:      counters.Admitted,
+		committed:     counters.Committed,
+		writeLost:     counters.WriteLost,
+		queueDrops:    counters.QueueDrops,
+		shutdownDrops: counters.ShutdownDrops,
+		retries:       counters.Retries,
+
+		lastSuccessAt:    lastSuccessAt,
+		lastLostAt:       lastLostAt,
+		lastLostReason:   lastLostReason,
+		lastCheckpointAt: lastCheckpointAt,
+
+		previousRun: previousRun,
 	}
 	if conversionErr != nil {
 		// A failed full VACUUM leaves the original database usable. Do not let a
@@ -266,11 +332,38 @@ func Open(opts Options) (*Store, error) {
 		// the existing backend status and retry the conversion on the next start.
 		s.fail(conversionErr)
 	}
+	if previousRun != nil && previousRun.State == flowstore.PreviousRunInterrupted {
+		// An open manifest means the previous process ended before Close could
+		// drain and account for its in-memory batch. The unresolved count is
+		// what the manifest knew about but cannot prove committed; record it as
+		// a sticky failure rather than silently starting fresh.
+		s.fail(fmt.Errorf(
+			"previous run ended without a clean close; %d admitted observation(s) cannot be confirmed committed and are presumed lost (rows already committed are intact)",
+			previousRun.Unresolved))
+	}
+
+	// Carry cumulative counters into a run_state=open manifest before the
+	// writer starts.
+	openCtx, openCancel := context.WithTimeout(context.Background(), opts.QueryTimeout)
+	if err := s.persistSnapshot(openCtx, runStateOpen); err != nil {
+		openCancel()
+		_ = db.Close()
+		return nil, err
+	}
+	openCancel()
 
 	s.wg.Add(1)
 	go s.run()
 
 	return s, nil
+}
+
+// derefTime reads an optional manifest timestamp.
+func derefTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
 }
 
 // configureIncrementalAutoVacuum enables SQLite's incremental auto-vacuum
@@ -432,16 +525,28 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// Close stops the writer, drains what is already queued, and releases the file.
-// Draining rather than discarding matters on a clean shutdown: those rows are
-// already accepted as far as the emit path is concerned.
+// Close stops the writer at a linearization boundary, drains what was already
+// accepted, and releases the file.
+//
+// Sequence and its guarantee: close the producer-visible boundary first, then
+// wait every producer that had passed the gate (inflight) to settle, and only
+// then authorize the writer's final drain. Thus an observation admitted before
+// the boundary is necessarily enqueued before the final drain consumes it; an
+// observation arriving at/after the boundary is counted, once, as a shutdown
+// drop. Nothing is left in a batch or stranded in the queue.
 func (s *Store) Close() error {
-	select {
-	case <-s.done:
+	s.gateMu.Lock()
+	if s.closed {
+		s.gateMu.Unlock()
 		return nil // already closed
-	default:
 	}
-	close(s.done)
+	s.closed = true
+	close(s.closing)
+	s.gateMu.Unlock()
+
+	s.inflight.Wait()
+	close(s.finalDrain)
+
 	s.wg.Wait()
 	return s.db.Close()
 }
